@@ -7,23 +7,17 @@ description: Call any MCP server tool as a CLI command with shell composition. U
 
 Call any configured MCP server tool from the command line with `--flag=value` style args and full shell composition support.
 
+If `mcp-call` is not found, install it: `pipx install mcp-cli-skill` or `uvx mcp-cli-skill`
+
 ## Commands
 
 ```bash
-# List configured MCP servers
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --servers
-
-# List tools for a server
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py <server> --tools
-
-# Call a tool
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py <server> <tool> --key=value ...
-
-# Add a new MCP server
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --add <name> <command> [args...] [--env KEY=VAL ...]
-
-# Remove an MCP server
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --remove <name>
+mcp-call --servers                                    # list configured servers
+mcp-call <server> --tools                             # list tools for a server
+mcp-call <server> <tool> --key=value ...              # call a tool
+mcp-call --add <name> <cmd> [args] [--env K=V ...]    # add server
+mcp-call --remove <name>                              # remove server
+mcp-call --sync                                       # re-sync from ~/.claude/settings.json
 ```
 
 ## Server Management
@@ -31,33 +25,19 @@ python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --remove <name>
 Config stored at `~/.mcp-cli/servers.json`. On first run, seeds from `~/.claude/settings.json`.
 
 ```bash
-# Add a server
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --add myredash uvx redash-mcp --env REDASH_URL=http://localhost --env REDASH_API_KEY=abc123
-
-# Add npx-based server
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --add github npx @modelcontextprotocol/server-github --env GITHUB_TOKEN=ghp_xxx
-
-# Remove a server
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --remove myredash
-
-# Re-sync new servers from ~/.claude/settings.json (merges, won't overwrite existing)
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --sync
+mcp-call --add myredash uvx redash-mcp --env REDASH_URL=http://localhost --env REDASH_API_KEY=abc123
+mcp-call --add github npx @modelcontextprotocol/server-github --env GITHUB_TOKEN=ghp_xxx
+mcp-call --remove myredash
+mcp-call --sync
 ```
 
 ## Examples
 
 ```bash
-# Run SQL from a file
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py redash redash_query --action=adhoc --query="$(cat /tmp/query.sql)" --data_source_id=1
-
-# List queries piped through jq
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py redash redash_query --action=list --page_size=5 | jq '.results[].name'
-
-# Send slack message from file content
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py slack slack_chat --action=post --channel=C123 --text="$(cat /tmp/msg.txt)"
-
-# Export query result to file
-python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py redash redash_query --action=run --id=42 | jq '.query_result.data.rows' > /tmp/result.json
+mcp-call redash redash_query --action=adhoc --query="$(cat /tmp/query.sql)" --data_source_id=1
+mcp-call redash redash_query --action=list --page_size=5 | jq '.results[].name'
+mcp-call slack slack_chat --action=post --channel=C123 --text="$(cat /tmp/msg.txt)"
+mcp-call redash redash_query --action=run --id=42 | jq '.query_result.data.rows' > /tmp/result.json
 ```
 
 ## When to Use
