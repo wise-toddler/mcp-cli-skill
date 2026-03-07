@@ -5,19 +5,36 @@ import os
 import subprocess
 import sys
 
+CONFIG_DIR = os.path.expanduser("~/.mcp-cli")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "servers.json")
+CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
+
+
+def _load_json(path):
+    """Load JSON file if it exists."""
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_config(servers):
+    """Save servers to standalone config."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(servers, f, indent=2)
+
 
 def read_config():
-    """Read MCP server config from Claude settings."""
-    for path in [
-        os.path.expanduser("~/.claude/settings.json"),
-        os.path.expanduser("~/.claude/settings.local.json"),
-    ]:
-        if os.path.exists(path):
-            with open(path) as f:
-                servers = json.load(f).get("mcpServers", {})
-                if servers:
-                    return servers
-    return {}
+    """Read MCP servers, seeding from Claude settings on first run."""
+    if os.path.exists(CONFIG_PATH):
+        return _load_json(CONFIG_PATH)
+    # first run: seed from ~/.claude/settings.json
+    servers = _load_json(CLAUDE_SETTINGS).get("mcpServers", {})
+    if servers:
+        _save_config(servers)
+        print(f"Seeded {len(servers)} servers from {CLAUDE_SETTINGS}", file=sys.stderr)
+    return servers
 
 
 def parse_value(val):
@@ -35,10 +52,22 @@ def parse_args():
         print("Usage: mcp_call.py <server> <tool> [--key=value ...]", file=sys.stderr)
         print("       mcp_call.py --servers", file=sys.stderr)
         print("       mcp_call.py <server> --tools", file=sys.stderr)
+        print("       mcp_call.py --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
+        print("       mcp_call.py --remove <name>", file=sys.stderr)
+        print("       mcp_call.py --sync", file=sys.stderr)
         sys.exit(0 if args else 1)
 
     if args[0] == "--servers":
         return "__servers__", None, {}
+    if args[0] == "--add":
+        return "__add__", None, {"_raw": args[1:]}
+    if args[0] == "--remove":
+        if len(args) < 2:
+            print("Usage: mcp_call.py --remove <name>", file=sys.stderr)
+            sys.exit(1)
+        return "__remove__", args[1], {}
+    if args[0] == "--sync":
+        return "__sync__", None, {}
 
     server = args[0]
     if len(args) < 2 or args[1] == "--tools":
@@ -139,12 +168,74 @@ def call_tool(proc, tool_name, tool_args):
                 print(item["text"])
 
 
+def add_server(raw_args):
+    """Add a new MCP server."""
+    if len(raw_args) < 2:
+        print("Usage: --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
+        sys.exit(1)
+    name = raw_args[0]
+    command = raw_args[1]
+    cmd_args = []
+    env = {}
+    i = 2
+    while i < len(raw_args):
+        if raw_args[i] == "--env" and i + 1 < len(raw_args):
+            k, v = raw_args[i + 1].split("=", 1)
+            env[k] = v
+            i += 2
+        else:
+            cmd_args.append(raw_args[i])
+            i += 1
+    servers = read_config()
+    entry = {"command": command}
+    if cmd_args:
+        entry["args"] = cmd_args
+    if env:
+        entry["env"] = env
+    servers[name] = entry
+    _save_config(servers)
+    print(f"Added server '{name}': {command} {' '.join(cmd_args)}")
+
+
+def remove_server(name):
+    """Remove an MCP server."""
+    servers = read_config()
+    if name not in servers:
+        print(f"Error: '{name}' not found.", file=sys.stderr)
+        sys.exit(1)
+    del servers[name]
+    _save_config(servers)
+    print(f"Removed server '{name}'")
+
+
+def sync_from_claude():
+    """Re-sync servers from ~/.claude/settings.json (merges, doesn't overwrite)."""
+    claude_servers = _load_json(CLAUDE_SETTINGS).get("mcpServers", {})
+    current = read_config()
+    added = 0
+    for name, cfg in claude_servers.items():
+        if name not in current:
+            current[name] = cfg
+            added += 1
+    _save_config(current)
+    print(f"Synced: {added} new servers added, {len(current)} total")
+
+
 def main():
     servers = read_config()
     server_name, tool_name, tool_args = parse_args()
 
     if server_name == "__servers__":
         list_servers(servers)
+        return
+    if server_name == "__add__":
+        add_server(tool_args["_raw"])
+        return
+    if server_name == "__remove__":
+        remove_server(tool_name)
+        return
+    if server_name == "__sync__":
+        sync_from_claude()
         return
 
     if server_name not in servers:

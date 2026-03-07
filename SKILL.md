@@ -18,6 +18,30 @@ python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py <server> --tools
 
 # Call a tool
 python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py <server> <tool> --key=value ...
+
+# Add a new MCP server
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --add <name> <command> [args...] [--env KEY=VAL ...]
+
+# Remove an MCP server
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --remove <name>
+```
+
+## Server Management
+
+Config stored at `~/.mcp-cli/servers.json`. On first run, seeds from `~/.claude/settings.json`.
+
+```bash
+# Add a server
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --add myredash uvx redash-mcp --env REDASH_URL=http://localhost --env REDASH_API_KEY=abc123
+
+# Add npx-based server
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --add github npx @modelcontextprotocol/server-github --env GITHUB_TOKEN=ghp_xxx
+
+# Remove a server
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --remove myredash
+
+# Re-sync new servers from ~/.claude/settings.json (merges, won't overwrite existing)
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --sync
 ```
 
 ## Examples
