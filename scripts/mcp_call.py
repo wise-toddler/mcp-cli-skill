@@ -113,19 +113,39 @@ def spawn_server(config):
     env = {**os.environ, **config.get("env", {})}
     return subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, text=True, env=env
+        stderr=subprocess.PIPE, text=True, env=env
     )
+
+
+def check_alive(proc):
+    """Check if server process is still running, print stderr if dead."""
+    if proc.poll() is not None:
+        stderr = proc.stderr.read() if proc.stderr else ""
+        print(f"Error: server exited with code {proc.returncode}", file=sys.stderr)
+        if stderr.strip():
+            print(stderr.strip(), file=sys.stderr)
+        sys.exit(1)
 
 
 def init_server(proc):
     """Initialize MCP handshake."""
-    send(proc, "initialize", {
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": {"name": "mcp-cli", "version": "1.0"}
-    }, msg_id=1)
-    recv(proc, expected_id=1)
-    send(proc, "notifications/initialized")
+    check_alive(proc)
+    try:
+        send(proc, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-cli", "version": "1.0"}
+        }, msg_id=1)
+        resp = recv(proc, expected_id=1)
+        if not resp:
+            check_alive(proc)
+            print("Error: no response from server during init", file=sys.stderr)
+            sys.exit(1)
+        send(proc, "notifications/initialized")
+    except BrokenPipeError:
+        check_alive(proc)
+        print("Error: server crashed during init", file=sys.stderr)
+        sys.exit(1)
 
 
 def list_servers(servers):
