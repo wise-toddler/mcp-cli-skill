@@ -21,6 +21,24 @@ python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py <server> --tools
 python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py <server> <tool> --key=value ...
 ```
 
+## Server Management
+
+Config stored at `~/.mcp-cli/servers.json`. On first run, auto-seeds from `~/.claude/settings.json`.
+
+```bash
+# Add a new MCP server
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --add myserver uvx some-mcp --env API_KEY=abc123
+
+# Add npx-based server
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --add github npx @modelcontextprotocol/server-github --env GITHUB_TOKEN=ghp_xxx
+
+# Remove a server
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --remove myserver
+
+# Re-sync new servers from ~/.claude/settings.json (merges, won't overwrite)
+python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py --sync
+```
+
 ## Why?
 
 MCP tool calls can't use shell composition. This skill lets agents (or you) call MCP tools via CLI with:
@@ -49,8 +67,8 @@ python3 ~/.claude/skills/mcp-cli/scripts/mcp_call.py redash redash_query \
 ## Requirements
 
 - Python 3.10+
-- MCP servers configured in `~/.claude/settings.json`
+- MCP servers configured in `~/.claude/settings.json` or `~/.mcp-cli/servers.json`
 
 ## How it works
 
-Reads MCP server config from `~/.claude/settings.json`, spawns the server as a subprocess, speaks JSON-RPC over stdio, and prints the result. Zero dependencies — pure Python stdlib.
+Reads MCP server config from `~/.mcp-cli/servers.json` (standalone, agent-agnostic). On first run, seeds from `~/.claude/settings.json`. Spawns the server as a subprocess, speaks JSON-RPC over stdio, and prints the result. Zero dependencies — pure Python stdlib.
