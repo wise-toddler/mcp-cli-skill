@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-cli-skill"
-version = "0.1.0"
+version = "0.2.0"
 description = "Call any MCP server tool from the command line with shell composition support"
 readme = "README.md"
 license = "MIT"

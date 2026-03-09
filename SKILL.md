@@ -15,14 +15,15 @@ If `mcp-call` is not found, install it: `pipx install mcp-cli-skill` or `uvx mcp
 mcp-call --servers                                    # list configured servers
 mcp-call <server> --tools                             # list tools for a server
 mcp-call <server> <tool> --key=value ...              # call a tool
-mcp-call --add <name> <cmd> [args] [--env K=V ...]    # add server
+mcp-call --add <name> <cmd> [args] [--env K=V ...]    # add stdio server
+mcp-call --add-http <name> <url>                      # add HTTP server
 mcp-call --remove <name>                              # remove server
-mcp-call --sync                                       # re-sync from ~/.claude/settings.json
+mcp-call --sync                                       # re-sync from Claude configs
 ```
 
 ## Server Management
 
-Config stored at `~/.mcp-cli/servers.json`. On first run, seeds from `~/.claude/settings.json`.
+Config stored at `~/.mcp-cli/servers.json`. On first run, seeds from `~/.claude/settings.json` and `~/.claude.json`. Supports both stdio and HTTP MCP servers.
 
 ```bash
 mcp-call --add myredash uvx redash-mcp --env REDASH_URL=http://localhost --env REDASH_API_KEY=abc123

@@ -4,10 +4,13 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 
 CONFIG_DIR = os.path.expanduser("~/.mcp-cli")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "servers.json")
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
+CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 
 
 def _load_json(path):
@@ -25,15 +28,44 @@ def _save_config(servers):
         json.dump(servers, f, indent=2)
 
 
+def _collect_claude_servers():
+    """Collect MCP servers from both settings.json and .claude.json."""
+    servers = {}
+    # settings.json — stdio servers
+    for name, cfg in _load_json(CLAUDE_SETTINGS).get("mcpServers", {}).items():
+        if "command" in cfg:
+            servers[name] = cfg
+        elif "url" in cfg:
+            servers[name] = {"type": "http", "url": cfg["url"]}
+    # .claude.json — root mcpServers + per-project servers
+    claude_json = _load_json(CLAUDE_JSON)
+    for name, cfg in claude_json.get("mcpServers", {}).items():
+        if name not in servers:
+            if "command" in cfg:
+                servers[name] = cfg
+            elif "url" in cfg:
+                servers[name] = {"type": "http", "url": cfg["url"]}
+    # per-project servers from .claude.json projects
+    for proj_path, proj_cfg in claude_json.get("projects", claude_json).items():
+        if not isinstance(proj_cfg, dict) or "mcpServers" not in proj_cfg:
+            continue
+        for name, cfg in proj_cfg["mcpServers"].items():
+            if name not in servers:
+                if "command" in cfg:
+                    servers[name] = cfg
+                elif "url" in cfg:
+                    servers[name] = {"type": "http", "url": cfg["url"]}
+    return servers
+
+
 def read_config():
-    """Read MCP servers, seeding from Claude settings on first run."""
+    """Read MCP servers, seeding from Claude configs on first run."""
     if os.path.exists(CONFIG_PATH):
         return _load_json(CONFIG_PATH)
-    # first run: seed from ~/.claude/settings.json
-    servers = _load_json(CLAUDE_SETTINGS).get("mcpServers", {})
+    servers = _collect_claude_servers()
     if servers:
         _save_config(servers)
-        print(f"Seeded {len(servers)} servers from {CLAUDE_SETTINGS}", file=sys.stderr)
+        print(f"Seeded {len(servers)} servers from Claude configs", file=sys.stderr)
     return servers
 
 
@@ -53,6 +85,7 @@ def parse_args():
         print("       mcp-call --servers", file=sys.stderr)
         print("       mcp-call <server> --tools", file=sys.stderr)
         print("       mcp-call --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
+        print("       mcp-call --add-http <name> <url>", file=sys.stderr)
         print("       mcp-call --remove <name>", file=sys.stderr)
         print("       mcp-call --sync", file=sys.stderr)
         sys.exit(0 if args else 1)
@@ -61,9 +94,14 @@ def parse_args():
         return "__servers__", None, {}
     if args[0] == "--add":
         return "__add__", None, {"_raw": args[1:]}
+    if args[0] == "--add-http":
+        if len(args) < 3:
+            print("Usage: mcp-call --add-http <name> <url>", file=sys.stderr)
+            sys.exit(1)
+        return "__add_http__", args[1], {"url": args[2]}
     if args[0] == "--remove":
         if len(args) < 2:
-            print("Usage: mcp_call.py --remove <name>", file=sys.stderr)
+            print("Usage: mcp-call --remove <name>", file=sys.stderr)
             sys.exit(1)
         return "__remove__", args[1], {}
     if args[0] == "--sync":
@@ -84,8 +122,131 @@ def parse_args():
     return server, tool, tool_args
 
 
+# --- HTTP transport ---
+
+class HttpSession:
+    """Manages HTTP MCP session with session ID tracking."""
+
+    def __init__(self, url):
+        self.url = url
+        self.session_id = None
+
+    def rpc(self, method, params=None, msg_id=1):
+        """Send JSON-RPC over HTTP and return response."""
+        msg = {"jsonrpc": "2.0", "method": method, "id": msg_id}
+        if params:
+            msg["params"] = params
+        data = json.dumps(msg).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        req = urllib.request.Request(self.url, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                # capture session ID from response
+                sid = resp.headers.get("Mcp-Session-Id")
+                if sid:
+                    self.session_id = sid
+                body = resp.read().decode()
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type:
+                    return _parse_sse(body, msg_id)
+                return json.loads(body)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            print(f"Error: HTTP {e.code} from {self.url}", file=sys.stderr)
+            if body.strip():
+                # strip HTML, show first 200 chars
+                clean = body.strip()
+                if "<html" in clean.lower():
+                    clean = "Server returned HTML error page (auth required?)"
+                print(clean[:500], file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            print(f"Error: cannot connect to {self.url}: {e.reason}", file=sys.stderr)
+            sys.exit(1)
+
+    def notify(self, method, params=None):
+        """Send JSON-RPC notification (no id, ignore response)."""
+        msg = {"jsonrpc": "2.0", "method": method}
+        if params:
+            msg["params"] = params
+        data = json.dumps(msg).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        req = urllib.request.Request(self.url, data=data, headers=headers)
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+
+
+def _parse_sse(body, expected_id):
+    """Parse SSE response and extract JSON-RPC message matching expected_id."""
+    for line in body.splitlines():
+        if line.startswith("data: "):
+            try:
+                msg = json.loads(line[6:])
+                if msg.get("id") == expected_id:
+                    return msg
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def http_init(session):
+    """Initialize HTTP MCP server."""
+    session.rpc("initialize", {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "mcp-cli", "version": "1.0"}
+    }, msg_id=1)
+    session.notify("notifications/initialized")
+
+
+def http_list_tools(url):
+    """List tools from HTTP MCP server."""
+    session = HttpSession(url)
+    http_init(session)
+    resp = session.rpc("tools/list", {}, msg_id=2)
+    if not resp or "result" not in resp:
+        return
+    for tool in resp["result"].get("tools", []):
+        schema = tool.get("inputSchema", {})
+        props = schema.get("properties", {})
+        flags = " ".join(f"--{k}" for k in props)
+        print(f"  {tool['name']:30s} {flags}")
+        if tool.get("description"):
+            print(f"    {tool['description']}")
+
+
+def http_call_tool(url, tool_name, tool_args):
+    """Call a tool on HTTP MCP server."""
+    session = HttpSession(url)
+    http_init(session)
+    resp = session.rpc("tools/call", {"name": tool_name, "arguments": tool_args}, msg_id=3)
+    if not resp:
+        print("Error: no response", file=sys.stderr)
+        sys.exit(1)
+    if "error" in resp:
+        print(json.dumps(resp["error"], indent=2), file=sys.stderr)
+        sys.exit(1)
+    for item in resp.get("result", {}).get("content", []):
+        if item.get("type") == "text":
+            try:
+                print(json.dumps(json.loads(item["text"]), indent=2, default=str))
+            except json.JSONDecodeError:
+                print(item["text"])
+
+
+# --- Stdio transport ---
+
 def send(proc, method, params=None, msg_id=None):
-    """Send JSON-RPC message."""
+    """Send JSON-RPC message via stdio."""
     msg = {"jsonrpc": "2.0", "method": method}
     if params:
         msg["params"] = params
@@ -96,7 +257,7 @@ def send(proc, method, params=None, msg_id=None):
 
 
 def recv(proc, expected_id=None):
-    """Read JSON-RPC response, optionally matching by id."""
+    """Read JSON-RPC response via stdio, optionally matching by id."""
     for _ in range(10):  # skip spurious responses (e.g. notification acks)
         line = proc.stdout.readline()
         if not line:
@@ -128,7 +289,7 @@ def check_alive(proc):
 
 
 def init_server(proc):
-    """Initialize MCP handshake."""
+    """Initialize stdio MCP handshake."""
     check_alive(proc)
     try:
         send(proc, "initialize", {
@@ -148,15 +309,8 @@ def init_server(proc):
         sys.exit(1)
 
 
-def list_servers(servers):
-    """Print configured servers."""
-    for name, cfg in servers.items():
-        cmd = " ".join([cfg["command"]] + cfg.get("args", []))
-        print(f"  {name:20s} → {cmd}")
-
-
-def list_tools(proc):
-    """List tools from server."""
+def stdio_list_tools(proc):
+    """List tools from stdio server."""
     send(proc, "tools/list", {}, msg_id=2)
     resp = recv(proc, expected_id=2)
     if not resp or "result" not in resp:
@@ -170,8 +324,8 @@ def list_tools(proc):
             print(f"    {tool['description']}")
 
 
-def call_tool(proc, tool_name, tool_args):
-    """Call a tool and print result."""
+def stdio_call_tool(proc, tool_name, tool_args):
+    """Call a tool on stdio server."""
     send(proc, "tools/call", {"name": tool_name, "arguments": tool_args}, msg_id=3)
     resp = recv(proc, expected_id=3)
     if not resp:
@@ -188,8 +342,25 @@ def call_tool(proc, tool_name, tool_args):
                 print(item["text"])
 
 
+# --- Server management ---
+
+def is_http(config):
+    """Check if server uses HTTP transport."""
+    return config.get("type") == "http" or "url" in config
+
+
+def list_servers(servers):
+    """Print configured servers."""
+    for name, cfg in servers.items():
+        if is_http(cfg):
+            print(f"  {name:20s} → {cfg['url']}  [http]")
+        else:
+            cmd = " ".join([cfg.get("command", "?")] + cfg.get("args", []))
+            print(f"  {name:20s} → {cmd}  [stdio]")
+
+
 def add_server(raw_args):
-    """Add a new MCP server."""
+    """Add a new stdio MCP server."""
     if len(raw_args) < 2:
         print("Usage: --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
         sys.exit(1)
@@ -217,6 +388,14 @@ def add_server(raw_args):
     print(f"Added server '{name}': {command} {' '.join(cmd_args)}")
 
 
+def add_http_server(name, url):
+    """Add a new HTTP MCP server."""
+    servers = read_config()
+    servers[name] = {"type": "http", "url": url}
+    _save_config(servers)
+    print(f"Added HTTP server '{name}': {url}")
+
+
 def remove_server(name):
     """Remove an MCP server."""
     servers = read_config()
@@ -229,8 +408,8 @@ def remove_server(name):
 
 
 def sync_from_claude():
-    """Re-sync servers from ~/.claude/settings.json (merges, doesn't overwrite)."""
-    claude_servers = _load_json(CLAUDE_SETTINGS).get("mcpServers", {})
+    """Re-sync servers from Claude configs (merges, doesn't overwrite)."""
+    claude_servers = _collect_claude_servers()
     current = read_config()
     added = 0
     for name, cfg in claude_servers.items():
@@ -239,6 +418,32 @@ def sync_from_claude():
             added += 1
     _save_config(current)
     print(f"Synced: {added} new servers added, {len(current)} total")
+
+
+# --- Main ---
+
+def run_server(config, tool_name, tool_args):
+    """Route to HTTP or stdio transport."""
+    if is_http(config):
+        url = config["url"]
+        if tool_name == "__tools__":
+            http_list_tools(url)
+        else:
+            http_call_tool(url, tool_name, tool_args)
+    else:
+        proc = spawn_server(config)
+        try:
+            init_server(proc)
+            if tool_name == "__tools__":
+                stdio_list_tools(proc)
+            else:
+                stdio_call_tool(proc, tool_name, tool_args)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 def main():
@@ -250,6 +455,9 @@ def main():
         return
     if server_name == "__add__":
         add_server(tool_args["_raw"])
+        return
+    if server_name == "__add_http__":
+        add_http_server(tool_name, tool_args["url"])
         return
     if server_name == "__remove__":
         remove_server(tool_name)
@@ -263,19 +471,7 @@ def main():
         list_servers(servers)
         sys.exit(1)
 
-    proc = spawn_server(servers[server_name])
-    try:
-        init_server(proc)
-        if tool_name == "__tools__":
-            list_tools(proc)
-        else:
-            call_tool(proc, tool_name, tool_args)
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    run_server(servers[server_name], tool_name, tool_args)
 
 
 if __name__ == "__main__":

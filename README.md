@@ -25,12 +25,13 @@ mcp-call <server> <tool> --key=value ...    # call a tool
 
 ## Server Management
 
-Config stored at `~/.mcp-cli/servers.json`. On first run, auto-seeds from `~/.claude/settings.json`.
+Config stored at `~/.mcp-cli/servers.json`. On first run, auto-seeds from `~/.claude/settings.json` and `~/.claude.json`. Supports both **stdio** and **HTTP** MCP transports.
 
 ```bash
 mcp-call --add myserver uvx some-mcp --env API_KEY=abc123
+mcp-call --add-http myapi http://localhost:8010/mcp
 mcp-call --remove myserver
-mcp-call --sync    # re-sync from ~/.claude/settings.json
+mcp-call --sync    # re-sync from Claude configs
 ```
 
 ## Why?
@@ -61,4 +62,4 @@ mcp-call redash redash_query \
 
 ## How it works
 
-Reads MCP server config from `~/.mcp-cli/servers.json` (standalone, agent-agnostic). On first run, seeds from `~/.claude/settings.json`. Spawns the server as a subprocess, speaks JSON-RPC over stdio, prints the result. Zero dependencies — pure Python stdlib.
+Reads MCP server config from `~/.mcp-cli/servers.json` (standalone, agent-agnostic). On first run, seeds from `~/.claude/settings.json` and `~/.claude.json`. For stdio servers, spawns the server as a subprocess and speaks JSON-RPC over stdin/stdout. For HTTP servers, sends JSON-RPC over HTTP with session ID tracking. Zero dependencies — pure Python stdlib.
