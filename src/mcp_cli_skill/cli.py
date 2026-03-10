@@ -81,9 +81,11 @@ def parse_args():
     """Parse CLI arguments into server, tool, and args dict."""
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
-        print("Usage: mcp-call <server> <tool> [--key=value ...]", file=sys.stderr)
+        print("Usage: mcp-call <server> <tool> [--key=value ...] [--json '{...}']", file=sys.stderr)
         print("       mcp-call --servers", file=sys.stderr)
         print("       mcp-call <server> --tools", file=sys.stderr)
+        print("       mcp-call <server> --discover", file=sys.stderr)
+        print("       mcp-call <server> <tool> --schema", file=sys.stderr)
         print("       mcp-call --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
         print("       mcp-call --add-http <name> <url>", file=sys.stderr)
         print("       mcp-call --remove <name>", file=sys.stderr)
@@ -110,15 +112,33 @@ def parse_args():
     server = args[0]
     if len(args) < 2 or args[1] == "--tools":
         return server, "__tools__", {}
+    if args[1] == "--discover":
+        return server, "__discover__", {}
 
     tool = args[1]
     tool_args = {}
-    for arg in args[2:]:
-        if arg.startswith("--") and "=" in arg:
+    i = 2
+    while i < len(args):
+        arg = args[i]
+        if arg == "--schema":
+            return server, "__schema__", {"_tool": tool}
+        elif arg == "--json" and i + 1 < len(args):
+            tool_args.update(json.loads(args[i + 1]))
+            i += 2
+            continue
+        elif arg.startswith("--json="):
+            tool_args.update(json.loads(arg[7:]))
+        elif arg.startswith("--") and "=" in arg:
             key, val = arg[2:].split("=", 1)
             tool_args[key] = parse_value(val)
         elif arg.startswith("--"):
             tool_args[arg[2:]] = True
+        i += 1
+    # read JSON from stdin if no args provided and stdin is piped
+    if not tool_args and not sys.stdin.isatty():
+        stdin_data = sys.stdin.read().strip()
+        if stdin_data:
+            tool_args = json.loads(stdin_data)
     return server, tool, tool_args
 
 
@@ -208,21 +228,6 @@ def http_init(session):
     session.notify("notifications/initialized")
 
 
-def http_list_tools(url):
-    """List tools from HTTP MCP server."""
-    session = HttpSession(url)
-    http_init(session)
-    resp = session.rpc("tools/list", {}, msg_id=2)
-    if not resp or "result" not in resp:
-        return
-    for tool in resp["result"].get("tools", []):
-        schema = tool.get("inputSchema", {})
-        props = schema.get("properties", {})
-        flags = " ".join(f"--{k}" for k in props)
-        print(f"  {tool['name']:30s} {flags}")
-        if tool.get("description"):
-            print(f"    {tool['description']}")
-
 
 def http_call_tool(url, tool_name, tool_args):
     """Call a tool on HTTP MCP server."""
@@ -309,20 +314,6 @@ def init_server(proc):
         sys.exit(1)
 
 
-def stdio_list_tools(proc):
-    """List tools from stdio server."""
-    send(proc, "tools/list", {}, msg_id=2)
-    resp = recv(proc, expected_id=2)
-    if not resp or "result" not in resp:
-        return
-    for tool in resp["result"].get("tools", []):
-        schema = tool.get("inputSchema", {})
-        props = schema.get("properties", {})
-        flags = " ".join(f"--{k}" for k in props)
-        print(f"  {tool['name']:30s} {flags}")
-        if tool.get("description"):
-            print(f"    {tool['description']}")
-
 
 def stdio_call_tool(proc, tool_name, tool_args):
     """Call a tool on stdio server."""
@@ -340,6 +331,44 @@ def stdio_call_tool(proc, tool_name, tool_args):
                 print(json.dumps(json.loads(item["text"]), indent=2, default=str))
             except json.JSONDecodeError:
                 print(item["text"])
+
+
+# --- Tool discovery ---
+
+def fetch_tools(config):
+    """Fetch tools list from server (HTTP or stdio)."""
+    if is_http(config):
+        session = HttpSession(config["url"])
+        http_init(session)
+        resp = session.rpc("tools/list", {}, msg_id=2)
+        if not resp or "result" not in resp:
+            return []
+        return resp["result"].get("tools", [])
+    proc = spawn_server(config)
+    try:
+        init_server(proc)
+        send(proc, "tools/list", {}, msg_id=2)
+        resp = recv(proc, expected_id=2)
+        if not resp or "result" not in resp:
+            return []
+        return resp["result"].get("tools", [])
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _print_tools(tools):
+    """Print tools in human-readable format."""
+    for tool in tools:
+        schema = tool.get("inputSchema", {})
+        props = schema.get("properties", {})
+        flags = " ".join(f"--{k}" for k in props)
+        print(f"  {tool['name']:30s} {flags}")
+        if tool.get("description"):
+            print(f"    {tool['description']}")
 
 
 # --- Server management ---
@@ -424,20 +453,32 @@ def sync_from_claude():
 
 def run_server(config, tool_name, tool_args):
     """Route to HTTP or stdio transport."""
-    if is_http(config):
-        url = config["url"]
+    # tool discovery commands
+    if tool_name in ("__tools__", "__discover__", "__schema__"):
+        tools = fetch_tools(config)
         if tool_name == "__tools__":
-            http_list_tools(url)
-        else:
-            http_call_tool(url, tool_name, tool_args)
+            _print_tools(tools)
+        elif tool_name == "__discover__":
+            out = [{"name": t["name"], "description": t.get("description", ""),
+                     "inputSchema": t.get("inputSchema", {})} for t in tools]
+            print(json.dumps(out, indent=2))
+        elif tool_name == "__schema__":
+            target = tool_args["_tool"]
+            for t in tools:
+                if t["name"] == target:
+                    print(json.dumps(t.get("inputSchema", {}), indent=2))
+                    return
+            print(f"Error: tool '{target}' not found", file=sys.stderr)
+            sys.exit(1)
+        return
+    # tool calls
+    if is_http(config):
+        http_call_tool(config["url"], tool_name, tool_args)
     else:
         proc = spawn_server(config)
         try:
             init_server(proc)
-            if tool_name == "__tools__":
-                stdio_list_tools(proc)
-            else:
-                stdio_call_tool(proc, tool_name, tool_args)
+            stdio_call_tool(proc, tool_name, tool_args)
         finally:
             proc.terminate()
             try:

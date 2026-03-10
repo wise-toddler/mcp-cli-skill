@@ -18,9 +18,13 @@ npx skills add wise-toddler/mcp-cli-skill -g
 ## Usage
 
 ```bash
-mcp-call --servers                          # list configured servers
-mcp-call <server> --tools                   # discover tools
-mcp-call <server> <tool> --key=value ...    # call a tool
+mcp-call --servers                              # list configured servers
+mcp-call <server> --tools                       # discover tools (human-readable)
+mcp-call <server> --discover                    # discover tools as JSON with schemas
+mcp-call <server> <tool> --schema               # show tool's input schema as JSON
+mcp-call <server> <tool> --key=value ...        # call a tool
+mcp-call <server> <tool> --json '{"key":"val"}' # call with JSON args
+echo '{}' | mcp-call <server> <tool>            # call with stdin JSON
 ```
 
 ## Server Management
@@ -55,6 +59,43 @@ mcp-call slack slack_chat \
 mcp-call redash redash_query \
   --action=list --page_size=5 | jq '.results[].name'
 ```
+
+## Multi-tool workflow example
+
+A bash script that an LLM agent can generate and run via its shell tool — querying a database, reading files, and posting to Slack, all orchestrated through `mcp-call`:
+
+```bash
+#!/bin/bash
+# Agent-generated script: fetch github issues, read related files, post to slack
+
+# 1. Fetch open bugs from github
+mcp-call github list_issues \
+  --owner=acme --repo=backend --state=open --labels=bug \
+  | jq '.[] | {number, title}' > /tmp/bugs.json
+
+# 2. Read the project README for context
+mcp-call filesystem read_file \
+  --path=/projects/backend/README.md > /tmp/readme.txt
+
+# 3. Search for related error patterns in code
+for title in $(jq -r '.[].title' /tmp/bugs.json | head -5); do
+  mcp-call github search_code \
+    --query="$title repo:acme/backend" \
+    | jq '.items[:2]'
+done > /tmp/code_matches.txt
+
+# 4. Post summary to slack
+mcp-call slack send_message \
+  --channel="#engineering" \
+  --text="*Open Bugs Summary*
+
+$(jq length /tmp/bugs.json) open bugs:
+$(jq -r '.[] | "• #\(.number): \(.title)"' /tmp/bugs.json)
+
+Related code matches: /tmp/code_matches.txt"
+```
+
+The key insight: an LLM agent writes this script in one shot, runs it via its Bash/shell tool, and gets the result — no need to make 4+ separate MCP tool calls with inline data. The agent can read files, pipe between tools, and use shell logic that MCP tool calls alone can't do.
 
 ## Requirements
 

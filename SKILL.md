@@ -13,8 +13,12 @@ If `mcp-call` is not found, install it: `pipx install mcp-cli-skill` or `uvx mcp
 
 ```bash
 mcp-call --servers                                    # list configured servers
-mcp-call <server> --tools                             # list tools for a server
+mcp-call <server> --tools                             # list tools (human-readable)
+mcp-call <server> --discover                          # list tools as JSON with schemas
+mcp-call <server> <tool> --schema                     # show tool's input schema as JSON
 mcp-call <server> <tool> --key=value ...              # call a tool
+mcp-call <server> <tool> --json '{"key":"val"}'       # call with JSON args
+echo '{}' | mcp-call <server> <tool>                  # call with stdin JSON
 mcp-call --add <name> <cmd> [args] [--env K=V ...]    # add stdio server
 mcp-call --add-http <name> <url>                      # add HTTP server
 mcp-call --remove <name>                              # remove server
@@ -40,6 +44,32 @@ mcp-call redash redash_query --action=list --page_size=5 | jq '.results[].name'
 mcp-call slack slack_chat --action=post --channel=C123 --text="$(cat /tmp/msg.txt)"
 mcp-call redash redash_query --action=run --id=42 | jq '.query_result.data.rows' > /tmp/result.json
 ```
+
+## Multi-tool Workflow
+
+When you need to chain multiple MCP tools together, generate a bash script and run it:
+
+```bash
+#!/bin/bash
+# Fetch github issues, search code, post to slack
+
+# 1. Fetch open bugs
+mcp-call github list_issues \
+  --owner=acme --repo=backend --state=open --labels=bug \
+  | jq '.[] | {number, title}' > /tmp/bugs.json
+
+# 2. Search for related code
+for title in $(jq -r '.[].title' /tmp/bugs.json | head -5); do
+  mcp-call github search_code --query="$title repo:acme/backend" | jq '.items[:2]'
+done > /tmp/code_matches.txt
+
+# 3. Post summary to slack
+mcp-call slack send_message \
+  --channel="#engineering" \
+  --text="$(jq -r '.[] | "• #\(.number): \(.title)"' /tmp/bugs.json)"
+```
+
+This is better than making separate MCP tool calls because you get file I/O, pipes, loops, and variable expansion for free.
 
 ## When to Use
 
