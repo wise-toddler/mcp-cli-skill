@@ -28,6 +28,14 @@ def _save_config(servers):
         json.dump(servers, f, indent=2)
 
 
+def _make_http_entry(cfg):
+    """Build HTTP server entry preserving headers."""
+    entry = {"type": "http", "url": cfg["url"]}
+    if cfg.get("headers"):
+        entry["headers"] = cfg["headers"]
+    return entry
+
+
 def _collect_claude_servers():
     """Collect MCP servers from both settings.json and .claude.json."""
     servers = {}
@@ -36,7 +44,7 @@ def _collect_claude_servers():
         if "command" in cfg:
             servers[name] = cfg
         elif "url" in cfg:
-            servers[name] = {"type": "http", "url": cfg["url"]}
+            servers[name] = _make_http_entry(cfg)
     # .claude.json — root mcpServers + per-project servers
     claude_json = _load_json(CLAUDE_JSON)
     for name, cfg in claude_json.get("mcpServers", {}).items():
@@ -44,7 +52,7 @@ def _collect_claude_servers():
             if "command" in cfg:
                 servers[name] = cfg
             elif "url" in cfg:
-                servers[name] = {"type": "http", "url": cfg["url"]}
+                servers[name] = _make_http_entry(cfg)
     # per-project servers from .claude.json projects
     for proj_path, proj_cfg in claude_json.get("projects", claude_json).items():
         if not isinstance(proj_cfg, dict) or "mcpServers" not in proj_cfg:
@@ -54,7 +62,7 @@ def _collect_claude_servers():
                 if "command" in cfg:
                     servers[name] = cfg
                 elif "url" in cfg:
-                    servers[name] = {"type": "http", "url": cfg["url"]}
+                    servers[name] = _make_http_entry(cfg)
     return servers
 
 
@@ -98,9 +106,18 @@ def parse_args():
         return "__add__", None, {"_raw": args[1:]}
     if args[0] == "--add-http":
         if len(args) < 3:
-            print("Usage: mcp-call --add-http <name> <url>", file=sys.stderr)
+            print("Usage: mcp-call --add-http <name> <url> [-H 'Key: Value' ...]", file=sys.stderr)
             sys.exit(1)
-        return "__add_http__", args[1], {"url": args[2]}
+        add_args = {"url": args[2], "headers": {}}
+        i = 3
+        while i < len(args):
+            if args[i] == "-H" and i + 1 < len(args):
+                k, v = args[i + 1].split(":", 1)
+                add_args["headers"][k.strip()] = v.strip()
+                i += 2
+            else:
+                i += 1
+        return "__add_http__", args[1], add_args
     if args[0] == "--remove":
         if len(args) < 2:
             print("Usage: mcp-call --remove <name>", file=sys.stderr)
@@ -147,9 +164,10 @@ def parse_args():
 class HttpSession:
     """Manages HTTP MCP session with session ID tracking."""
 
-    def __init__(self, url):
+    def __init__(self, url, extra_headers=None):
         self.url = url
         self.session_id = None
+        self.extra_headers = extra_headers or {}
 
     def rpc(self, method, params=None, msg_id=1):
         """Send JSON-RPC over HTTP and return response."""
@@ -161,6 +179,7 @@ class HttpSession:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
+        headers.update(self.extra_headers)
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
         req = urllib.request.Request(self.url, data=data, headers=headers)
@@ -196,6 +215,7 @@ class HttpSession:
             msg["params"] = params
         data = json.dumps(msg).encode()
         headers = {"Content-Type": "application/json"}
+        headers.update(self.extra_headers)
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
         req = urllib.request.Request(self.url, data=data, headers=headers)
@@ -229,9 +249,9 @@ def http_init(session):
 
 
 
-def http_call_tool(url, tool_name, tool_args):
+def http_call_tool(url, tool_name, tool_args, extra_headers=None):
     """Call a tool on HTTP MCP server."""
-    session = HttpSession(url)
+    session = HttpSession(url, extra_headers)
     http_init(session)
     resp = session.rpc("tools/call", {"name": tool_name, "arguments": tool_args}, msg_id=3)
     if not resp:
@@ -338,7 +358,7 @@ def stdio_call_tool(proc, tool_name, tool_args):
 def fetch_tools(config):
     """Fetch tools list from server (HTTP or stdio)."""
     if is_http(config):
-        session = HttpSession(config["url"])
+        session = HttpSession(config["url"], config.get("headers"))
         http_init(session)
         resp = session.rpc("tools/list", {}, msg_id=2)
         if not resp or "result" not in resp:
@@ -417,10 +437,13 @@ def add_server(raw_args):
     print(f"Added server '{name}': {command} {' '.join(cmd_args)}")
 
 
-def add_http_server(name, url):
+def add_http_server(name, url, headers=None):
     """Add a new HTTP MCP server."""
     servers = read_config()
-    servers[name] = {"type": "http", "url": url}
+    entry = {"type": "http", "url": url}
+    if headers:
+        entry["headers"] = headers
+    servers[name] = entry
     _save_config(servers)
     print(f"Added HTTP server '{name}': {url}")
 
@@ -473,7 +496,7 @@ def run_server(config, tool_name, tool_args):
         return
     # tool calls
     if is_http(config):
-        http_call_tool(config["url"], tool_name, tool_args)
+        http_call_tool(config["url"], tool_name, tool_args, config.get("headers"))
     else:
         proc = spawn_server(config)
         try:
@@ -498,7 +521,7 @@ def main():
         add_server(tool_args["_raw"])
         return
     if server_name == "__add_http__":
-        add_http_server(tool_name, tool_args["url"])
+        add_http_server(tool_name, tool_args["url"], tool_args.get("headers"))
         return
     if server_name == "__remove__":
         remove_server(tool_name)
