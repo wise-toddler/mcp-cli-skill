@@ -283,13 +283,21 @@ def send(proc, method, params=None, msg_id=None):
 
 def recv(proc, expected_id=None):
     """Read JSON-RPC response via stdio, optionally matching by id."""
-    for _ in range(10):  # skip spurious responses (e.g. notification acks)
+    non_json = []
+    for _ in range(50):
         line = proc.stdout.readline()
         if not line:
-            return None
-        resp = json.loads(line)
+            break
+        try:
+            resp = json.loads(line)
+        except json.JSONDecodeError:
+            non_json.append(line.rstrip())
+            continue
         if expected_id is None or resp.get("id") == expected_id:
             return resp
+    # no valid JSON-RPC response — show what server actually said
+    if non_json:
+        print("\n".join(non_json))
     return None
 
 
