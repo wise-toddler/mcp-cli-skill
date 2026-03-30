@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Call any MCP server tool from CLI with --flag=value args."""
+import base64
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import urllib.request
 import urllib.error
 
+MCP_CALL_TMPDIR = os.path.join(tempfile.gettempdir(), "mcp-call")
 CONFIG_DIR = os.path.expanduser("~/.mcp-cli")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "servers.json")
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
@@ -159,6 +162,23 @@ def parse_args():
     return server, tool, tool_args
 
 
+def _print_content(items):
+    """Print MCP content blocks (text, image, etc.)."""
+    for item in items:
+        if item.get("type") == "text":
+            try:
+                print(json.dumps(json.loads(item["text"]), indent=2, default=str))
+            except json.JSONDecodeError:
+                print(item["text"])
+        elif item.get("type") == "image":
+            os.makedirs(MCP_CALL_TMPDIR, exist_ok=True)
+            ext = item.get("mimeType", "image/png").split("/")[-1]
+            fd, path = tempfile.mkstemp(suffix=f".{ext}", prefix="mcp-", dir=MCP_CALL_TMPDIR)
+            os.write(fd, base64.b64decode(item["data"]))
+            os.close(fd)
+            print(path)
+
+
 # --- HTTP transport ---
 
 class HttpSession:
@@ -260,12 +280,7 @@ def http_call_tool(url, tool_name, tool_args, extra_headers=None):
     if "error" in resp:
         print(json.dumps(resp["error"], indent=2), file=sys.stderr)
         sys.exit(1)
-    for item in resp.get("result", {}).get("content", []):
-        if item.get("type") == "text":
-            try:
-                print(json.dumps(json.loads(item["text"]), indent=2, default=str))
-            except json.JSONDecodeError:
-                print(item["text"])
+    _print_content(resp.get("result", {}).get("content", []))
 
 
 # --- Stdio transport ---
@@ -353,12 +368,7 @@ def stdio_call_tool(proc, tool_name, tool_args):
     if "error" in resp:
         print(json.dumps(resp["error"], indent=2), file=sys.stderr)
         sys.exit(1)
-    for item in resp.get("result", {}).get("content", []):
-        if item.get("type") == "text":
-            try:
-                print(json.dumps(json.loads(item["text"]), indent=2, default=str))
-            except json.JSONDecodeError:
-                print(item["text"])
+    _print_content(resp.get("result", {}).get("content", []))
 
 
 # --- Tool discovery ---
