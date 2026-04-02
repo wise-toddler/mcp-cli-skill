@@ -91,6 +91,15 @@ def parse_value(val):
 def parse_args():
     """Parse CLI arguments into server, tool, and args dict."""
     args = sys.argv[1:]
+    if args and args[0] == "--version":
+        # __version__ lives in __init__.py, pyproject.toml reads from there
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "__init__.py")) as f:
+            for line in f:
+                if line.startswith("__version__"):
+                    print(line.split("=")[1].strip().strip('"'))
+                    break
+        sys.exit(0)
     if not args or args[0] in ("-h", "--help"):
         print("Usage: mcp-call <server> <tool> [--key=value ...] [--json '{...}']", file=sys.stderr)
         print("       mcp-call --servers", file=sys.stderr)
