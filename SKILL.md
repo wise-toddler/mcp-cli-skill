@@ -17,7 +17,7 @@ mcp-call <server> --tools                             # list tools (human-readab
 mcp-call <server> --discover                          # list tools as JSON with schemas
 mcp-call <server> <tool> --schema                     # show tool's input schema as JSON
 mcp-call <server> <tool> --key=value ...              # call a tool
-mcp-call <server> <tool> --json '{"key":"val"}'       # call with JSON args
+mcp-call <server> <tool> --input-json '{"key":"val"}'  # call with JSON args
 echo '{}' | mcp-call <server> <tool>                  # call with stdin JSON
 mcp-call --add <name> <cmd> [args] [--env K=V ...]    # add stdio server
 mcp-call --add-http <name> <url>                      # add HTTP server

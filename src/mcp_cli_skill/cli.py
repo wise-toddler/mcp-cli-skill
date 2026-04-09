@@ -101,7 +101,7 @@ def parse_args():
                     break
         sys.exit(0)
     if not args or args[0] in ("-h", "--help"):
-        print("Usage: mcp-call <server> <tool> [--key=value ...] [--json '{...}']", file=sys.stderr)
+        print("Usage: mcp-call <server> <tool> [--key=value ...] [--input-json '{...}']", file=sys.stderr)
         print("       mcp-call --servers", file=sys.stderr)
         print("       mcp-call <server> --tools", file=sys.stderr)
         print("       mcp-call <server> --discover", file=sys.stderr)
@@ -151,12 +151,12 @@ def parse_args():
         arg = args[i]
         if arg == "--schema":
             return server, "__schema__", {"_tool": tool}
-        elif arg == "--json" and i + 1 < len(args):
+        elif arg == "--input-json" and i + 1 < len(args):
             tool_args.update(json.loads(args[i + 1]))
             i += 2
             continue
-        elif arg.startswith("--json="):
-            tool_args.update(json.loads(arg[7:]))
+        elif arg.startswith("--input-json="):
+            tool_args.update(json.loads(arg[13:]))
         elif arg.startswith("--") and "=" in arg:
             key, val = arg[2:].split("=", 1)
             tool_args[key] = parse_value(val)

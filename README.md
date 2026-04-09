@@ -23,7 +23,7 @@ mcp-call <server> --tools                       # discover tools (human-readable
 mcp-call <server> --discover                    # discover tools as JSON with schemas
 mcp-call <server> <tool> --schema               # show tool's input schema as JSON
 mcp-call <server> <tool> --key=value ...        # call a tool
-mcp-call <server> <tool> --json '{"key":"val"}' # call with JSON args
+mcp-call <server> <tool> --input-json '{"k":"v"}' # call with JSON args
 echo '{}' | mcp-call <server> <tool>            # call with stdin JSON
 ```
 
