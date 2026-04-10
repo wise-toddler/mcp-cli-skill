@@ -161,6 +161,11 @@ def parse_args():
             key, val = arg[2:].split("=", 1)
             tool_args[key] = parse_value(val)
         elif arg.startswith("--"):
+            # --flag value (space-separated) or --flag (boolean)
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                tool_args[arg[2:]] = parse_value(args[i + 1])
+                i += 2
+                continue
             tool_args[arg[2:]] = True
         i += 1
     # read JSON from stdin if no args provided and stdin is piped
