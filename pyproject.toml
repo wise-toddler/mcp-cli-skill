@@ -26,6 +26,7 @@ Repository = "https://github.com/wise-toddler/mcp-cli-skill"
 
 [project.scripts]
 mcp-call = "mcp_cli_skill.cli:main"
+mcp-cli-skill = "mcp_cli_skill.cli:main"
 
 [tool.hatch.version]
 path = "src/mcp_cli_skill/__init__.py"
