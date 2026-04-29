@@ -212,6 +212,7 @@ class HttpSession:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
+            "User-Agent": "mcp-cli/1.0",
         }
         headers.update(self.extra_headers)
         if self.session_id:
