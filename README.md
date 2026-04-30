@@ -38,6 +38,20 @@ mcp-call --remove myserver
 mcp-call --sync    # re-sync from Claude configs
 ```
 
+### Environment variables
+
+`${VAR}` patterns in URLs, headers, command args, and env values are expanded at runtime:
+
+```json
+{
+  "myapi": {
+    "type": "http",
+    "url": "https://${API_HOST}/mcp",
+    "headers": { "X-API-Key": "${MY_API_KEY}" }
+  }
+}
+```
+
 ## Why?
 
 MCP tool calls can't use shell composition. This CLI lets agents (or you) use:

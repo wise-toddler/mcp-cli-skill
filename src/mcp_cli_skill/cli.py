@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import re
 import urllib.request
 import urllib.error
 
@@ -193,15 +194,20 @@ def _print_content(items):
             print(path)
 
 
+def _expand_env(val):
+    """Expand ${VAR} patterns in a string using env variables."""
+    return re.sub(r'\$\{(\w+)\}', lambda m: os.environ.get(m.group(1), m.group(0)), val)
+
+
 # --- HTTP transport ---
 
 class HttpSession:
     """Manages HTTP MCP session with session ID tracking."""
 
     def __init__(self, url, extra_headers=None):
-        self.url = url
+        self.url = _expand_env(url)
         self.session_id = None
-        self.extra_headers = extra_headers or {}
+        self.extra_headers = {k: _expand_env(v) for k, v in (extra_headers or {}).items()}
 
     def rpc(self, method, params=None, msg_id=1):
         """Send JSON-RPC over HTTP and return response."""
@@ -333,8 +339,8 @@ def recv(proc, expected_id=None):
 
 def spawn_server(config):
     """Spawn MCP server subprocess."""
-    cmd = [config["command"]] + config.get("args", [])
-    env = {**os.environ, **config.get("env", {})}
+    cmd = [_expand_env(config["command"])] + [_expand_env(a) for a in config.get("args", [])]
+    env = {**os.environ, **{k: _expand_env(v) for k, v in config.get("env", {}).items()}}
     return subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, env=env
