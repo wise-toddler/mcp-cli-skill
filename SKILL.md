@@ -7,7 +7,8 @@ description: Call any MCP server tool as a CLI command with shell composition. U
 
 Call any configured MCP server tool from the command line with `--flag=value` style args and full shell composition support.
 
-If `mcp-call` is not found, install it: `pipx install mcp-cli-skill` or `uvx mcp-cli-skill`
+If `mcp-call` is not found, install it first: `uv tool install mcp-cli-skill`
+Always use `mcp-call` as the command, never `uvx mcp-cli-skill`.
 
 ## Commands
 
