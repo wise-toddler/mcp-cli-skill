@@ -420,14 +420,32 @@ def fetch_tools(config):
 
 
 def _print_tools(tools):
-    """Print tools in human-readable format."""
+    """Print tools in human-readable format with colors on a TTY."""
+    color = sys.stdout.isatty()
+    bold = "\033[1m" if color else ""
+    cyan = "\033[36m" if color else ""
+    dim = "\033[2m" if color else ""
+    yellow = "\033[33m" if color else ""
+    reset = "\033[0m" if color else ""
+    print(f"{dim}{len(tools)} tools  ({yellow}*{dim} = required){reset}\n")
     for tool in tools:
         schema = tool.get("inputSchema", {})
         props = schema.get("properties", {})
-        flags = " ".join(f"--{k}" for k in props)
-        print(f"  {tool['name']:30s} {flags}")
-        if tool.get("description"):
-            print(f"    {tool['description']}")
+        required = set(schema.get("required", []))
+        # required flags marked with *, sorted required-first
+        flags = []
+        for k in sorted(props, key=lambda x: x not in required):
+            mark = f"{yellow}*{reset}" if k in required else ""
+            col = yellow if k in required else dim
+            flags.append(f"{col}--{k}{reset}{mark}")
+        print(f"  {cyan}{bold}{tool['name']}{reset}")
+        # only the summary line — skip verbose "Args:" docstring section
+        desc = (tool.get("description") or "").strip().split("\n")[0]
+        if desc:
+            print(f"    {dim}{desc}{reset}")
+        if flags:
+            print(f"    {' '.join(flags)}")
+        print()
 
 
 # --- Server management ---
