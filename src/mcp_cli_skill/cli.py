@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import re
+import shutil
 import urllib.request
 import urllib.error
 
@@ -106,7 +107,8 @@ def parse_args():
         print("       mcp-call --servers", file=sys.stderr)
         print("       mcp-call <server> --tools", file=sys.stderr)
         print("       mcp-call <server> --discover", file=sys.stderr)
-        print("       mcp-call <server> <tool> --schema", file=sys.stderr)
+        print("       mcp-call <server> <tool> --help     (formatted help)", file=sys.stderr)
+        print("       mcp-call <server> <tool> --schema   (raw JSON schema)", file=sys.stderr)
         print("       mcp-call --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
         print("       mcp-call --add-http <name> <url>", file=sys.stderr)
         print("       mcp-call --remove <name>", file=sys.stderr)
@@ -152,6 +154,8 @@ def parse_args():
         arg = args[i]
         if arg == "--schema":
             return server, "__schema__", {"_tool": tool}
+        elif arg in ("--help", "-h"):
+            return server, "__help__", {"_tool": tool}
         elif arg == "--input-json" and i + 1 < len(args):
             tool_args.update(json.loads(args[i + 1]))
             i += 2
@@ -419,15 +423,26 @@ def fetch_tools(config):
             proc.kill()
 
 
+def _colors():
+    """Return ANSI color codes if stdout is a TTY, else empty strings."""
+    on = sys.stdout.isatty()
+    return {
+        "bold": "\033[1m" if on else "",
+        "dim": "\033[2m" if on else "",
+        "red": "\033[31m" if on else "",
+        "green": "\033[32m" if on else "",
+        "yellow": "\033[33m" if on else "",
+        "blue": "\033[34m" if on else "",
+        "magenta": "\033[35m" if on else "",
+        "cyan": "\033[36m" if on else "",
+        "reset": "\033[0m" if on else "",
+    }
+
+
 def _print_tools(tools):
     """Print tools in human-readable format with colors on a TTY."""
-    color = sys.stdout.isatty()
-    bold = "\033[1m" if color else ""
-    cyan = "\033[36m" if color else ""
-    dim = "\033[2m" if color else ""
-    yellow = "\033[33m" if color else ""
-    reset = "\033[0m" if color else ""
-    print(f"{dim}{len(tools)} tools  ({yellow}*{dim} = required){reset}\n")
+    c = _colors()
+    print(f"{c['dim']}{len(tools)} tools  ({c['yellow']}*{c['dim']} = required){c['reset']}\n")
     for tool in tools:
         schema = tool.get("inputSchema", {})
         props = schema.get("properties", {})
@@ -435,17 +450,62 @@ def _print_tools(tools):
         # required flags marked with *, sorted required-first
         flags = []
         for k in sorted(props, key=lambda x: x not in required):
-            mark = f"{yellow}*{reset}" if k in required else ""
-            col = yellow if k in required else dim
-            flags.append(f"{col}--{k}{reset}{mark}")
-        print(f"  {cyan}{bold}{tool['name']}{reset}")
+            mark = f"{c['yellow']}*{c['reset']}" if k in required else ""
+            col = c["yellow"] if k in required else c["dim"]
+            flags.append(f"{col}--{k}{c['reset']}{mark}")
+        print(f"  {c['cyan']}{c['bold']}{tool['name']}{c['reset']}")
         # only the summary line — skip verbose "Args:" docstring section
         desc = (tool.get("description") or "").strip().split("\n")[0]
         if desc:
-            print(f"    {dim}{desc}{reset}")
+            print(f"    {c['dim']}{desc}{c['reset']}")
         if flags:
             print(f"    {' '.join(flags)}")
         print()
+
+
+def _print_tool_help(server_name, tool):
+    """Print formatted help for a single tool — usage, params, example."""
+    c = _colors()
+    schema = tool.get("inputSchema", {})
+    props = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    # header
+    print(f"\n{c['bold']}{c['cyan']}{tool['name']}{c['reset']}  {c['dim']}({server_name}){c['reset']}")
+    desc = (tool.get("description") or "").strip()
+    if desc:
+        print()
+        for line in desc.split("\n"):
+            print(f"  {c['dim']}{line}{c['reset']}")
+    # usage
+    print(f"\n{c['bold']}Usage:{c['reset']}")
+    req_part = " ".join(f"{c['yellow']}--{k}=<{c['reset']}{c['dim']}{props.get(k, {}).get('type', 'value')}{c['reset']}{c['yellow']}>{c['reset']}" for k in sorted(required))
+    print(f"  mcp-call {server_name} {tool['name']} {req_part}".rstrip())
+    # required args
+    if required:
+        print(f"\n{c['bold']}Required:{c['reset']}")
+        for k in sorted(required):
+            _print_arg(k, props.get(k, {}), c, required=True)
+    # optional args
+    optional = [k for k in props if k not in required]
+    if optional:
+        print(f"\n{c['bold']}Optional:{c['reset']}")
+        for k in sorted(optional):
+            _print_arg(k, props.get(k, {}), c, required=False)
+    print()
+
+
+def _print_arg(name, prop, c, required):
+    """Print one argument's signature + description."""
+    t = prop.get("type", "any")
+    enum = prop.get("enum")
+    type_str = f"{'|'.join(map(str, enum))}" if enum else t
+    flag_col = c["yellow"] if required else c["reset"]
+    mark = f"{c['yellow']}*{c['reset']}" if required else ""
+    print(f"  {flag_col}--{name}{c['reset']}{mark} {c['dim']}<{type_str}>{c['reset']}")
+    desc = prop.get("description", "").strip()
+    if desc:
+        for line in desc.split("\n"):
+            print(f"      {c['dim']}{line}{c['reset']}")
 
 
 # --- Server management ---
@@ -455,14 +515,60 @@ def is_http(config):
     return config.get("type") == "http" or "url" in config
 
 
+def _config_key(cfg):
+    """Hashable identity for a server config — used to collapse duplicates."""
+    if is_http(cfg):
+        return ("http", cfg["url"])
+    return ("stdio", cfg.get("command", "?"), tuple(cfg.get("args", [])))
+
+
+def _truncate(text, width):
+    """Truncate text to width with an ellipsis if it doesn't fit."""
+    return text if len(text) <= width else text[: max(0, width - 1)] + "…"
+
+
 def list_servers(servers):
-    """Print configured servers."""
+    """Print configured servers grouped by transport, collapsing duplicates."""
+    c = _colors()
+    term_w = shutil.get_terminal_size((100, 24)).columns
+    # split + group by config identity
+    http_groups, stdio_groups = {}, {}
     for name, cfg in servers.items():
-        if is_http(cfg):
-            print(f"  {name:20s} → {cfg['url']}  [http]")
-        else:
-            cmd = " ".join([cfg.get("command", "?")] + cfg.get("args", []))
-            print(f"  {name:20s} → {cmd}  [stdio]")
+        bucket = http_groups if is_http(cfg) else stdio_groups
+        bucket.setdefault(_config_key(cfg), []).append(name)
+    max_name = min(max((len(n) for n in servers), default=20), 28)
+
+    def print_group(label, color, groups, target_fn):
+        total = sum(len(v) for v in groups.values())
+        unique = len(groups)
+        suffix = "" if unique == total else f" {c['dim']}({unique} unique, {total} total){c['reset']}"
+        print(f"\n{c['bold']}{color}{label}{c['reset']} {c['dim']}({total}){c['reset']}{suffix}\n")
+        # sort by first name in each group, alphabetical
+        for key, names in sorted(groups.items(), key=lambda kv: kv[1][0].lower()):
+            names_sorted = sorted(names)
+            primary = names_sorted[0]
+            target = target_fn(key)
+            # compute remaining width for the target
+            base = f"  ● {primary:<{max_name}}  "
+            visible_len = len(base)
+            avail = max(20, term_w - visible_len - 4)
+            target_disp = _truncate(target, avail)
+            line = f"  {c['green']}●{c['reset']} {c['bold']}{primary:<{max_name}}{c['reset']}  {c['dim']}{target_disp}{c['reset']}"
+            if len(names_sorted) > 1:
+                line += f"  {c['yellow']}×{len(names_sorted)}{c['reset']}"
+            print(line)
+            # show extra aliases under primary, indented
+            if len(names_sorted) > 1:
+                aliases = ", ".join(names_sorted[1:6])
+                more = f" +{len(names_sorted) - 6} more" if len(names_sorted) > 6 else ""
+                print(f"    {c['dim']}aliases: {aliases}{more}{c['reset']}")
+
+    if http_groups:
+        print_group("HTTP", c["cyan"], http_groups, lambda k: k[1])
+    if stdio_groups:
+        print_group("STDIO", c["magenta"], stdio_groups,
+                    lambda k: (k[1] + (" " + " ".join(k[2]) if k[2] else "")))
+    print()
 
 
 def add_server(raw_args):
@@ -531,10 +637,10 @@ def sync_from_claude():
 
 # --- Main ---
 
-def run_server(config, tool_name, tool_args):
+def run_server(config, tool_name, tool_args, server_name=""):
     """Route to HTTP or stdio transport."""
     # tool discovery commands
-    if tool_name in ("__tools__", "__discover__", "__schema__"):
+    if tool_name in ("__tools__", "__discover__", "__schema__", "__help__"):
         tools = fetch_tools(config)
         if tool_name == "__tools__":
             _print_tools(tools)
@@ -547,6 +653,14 @@ def run_server(config, tool_name, tool_args):
             for t in tools:
                 if t["name"] == target:
                     print(json.dumps(t.get("inputSchema", {}), indent=2))
+                    return
+            print(f"Error: tool '{target}' not found", file=sys.stderr)
+            sys.exit(1)
+        elif tool_name == "__help__":
+            target = tool_args["_tool"]
+            for t in tools:
+                if t["name"] == target:
+                    _print_tool_help(server_name or "<server>", t)
                     return
             print(f"Error: tool '{target}' not found", file=sys.stderr)
             sys.exit(1)
@@ -592,7 +706,7 @@ def main():
         list_servers(servers)
         sys.exit(1)
 
-    run_server(servers[server_name], tool_name, tool_args)
+    run_server(servers[server_name], tool_name, tool_args, server_name)
 
 
 if __name__ == "__main__":
