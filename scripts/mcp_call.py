@@ -8,6 +8,7 @@ import sys
 import tempfile
 import re
 import shutil
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -213,6 +214,30 @@ class HttpSession:
         self.session_id = None
         self.extra_headers = {k: _expand_env(v) for k, v in (extra_headers or {}).items()}
 
+    def _send(self, data, headers, timeout=30, max_redirects=3):
+        """POST data and follow 307/308 redirects preserving method+body.
+
+        urllib's default HTTPRedirectHandler does NOT follow 307/308 on POST,
+        only on GET/HEAD. We handle them explicitly here.
+        """
+        url = self.url
+        for _ in range(max_redirects + 1):
+            req = urllib.request.Request(url, data=data, headers=headers)
+            try:
+                return urllib.request.urlopen(req, timeout=timeout)
+            except urllib.error.HTTPError as e:
+                if e.code in (307, 308) and e.headers.get("Location"):
+                    new_url = urllib.parse.urljoin(url, e.headers["Location"])
+                    try:
+                        e.close()
+                    except Exception:
+                        pass
+                    url = new_url
+                    self.url = url  # cache redirected URL for subsequent calls
+                    continue
+                raise
+        raise urllib.error.HTTPError(url, 308, "Too many redirects", None, None)
+
     def rpc(self, method, params=None, msg_id=1):
         """Send JSON-RPC over HTTP and return response."""
         msg = {"jsonrpc": "2.0", "method": method, "id": msg_id}
@@ -227,9 +252,8 @@ class HttpSession:
         headers.update(self.extra_headers)
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
-        req = urllib.request.Request(self.url, data=data, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with self._send(data, headers) as resp:
                 # capture session ID from response
                 sid = resp.headers.get("Mcp-Session-Id")
                 if sid:
@@ -259,13 +283,12 @@ class HttpSession:
         if params:
             msg["params"] = params
         data = json.dumps(msg).encode()
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "User-Agent": "mcp-cli/1.0"}
         headers.update(self.extra_headers)
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
-        req = urllib.request.Request(self.url, data=data, headers=headers)
         try:
-            urllib.request.urlopen(req, timeout=10)
+            self._send(data, headers, timeout=10)
         except Exception:
             pass
 
