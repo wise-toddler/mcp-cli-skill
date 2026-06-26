@@ -38,6 +38,27 @@ mcp-call --remove myserver
 mcp-call --sync    # re-sync from Claude configs
 ```
 
+## Shell completion
+
+Tab completion suggests server names, tool names, and flag names (no MCP roundtrip — reads a local cache).
+
+```bash
+# bash — add to ~/.bashrc
+eval "$(mcp-call --completion bash)"
+
+# zsh — add to ~/.zshrc
+eval "$(mcp-call --completion zsh)"
+
+# fish — write once
+mcp-call --completion fish > ~/.config/fish/completions/mcp-call.fish
+
+# Populate the tool cache once (or re-run after server changes):
+mcp-call --refresh-completions
+mcp-call --clear-cache [server]
+```
+
+The cache lives at `~/.mcp-cli/cache/tools-<server>.json` and is also refreshed whenever you run `mcp-call <server> --tools`.
+
 ### Environment variables
 
 `${VAR}` patterns in URLs, headers, command args, and env values are expanded at runtime:

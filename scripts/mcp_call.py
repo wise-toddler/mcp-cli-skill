@@ -8,6 +8,7 @@ import sys
 import tempfile
 import re
 import shutil
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -15,8 +16,20 @@ import urllib.error
 MCP_CALL_TMPDIR = os.path.join(tempfile.gettempdir(), "mcp-call")
 CONFIG_DIR = os.path.expanduser("~/.mcp-cli")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "servers.json")
+CACHE_DIR = os.path.join(CONFIG_DIR, "cache")
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+
+# CLI flags that don't take a positional server/tool — used for completion.
+META_FLAGS = (
+    "--servers", "--sync", "--add", "--add-http", "--remove",
+    "--completion", "--refresh-completions", "--clear-cache",
+    "--version", "--help",
+)
+# Flags valid after a server name (no tool yet).
+SERVER_FLAGS = ("--tools", "--discover", "--help")
+# Flags valid after a server + tool.
+TOOL_FLAGS = ("--help", "--schema", "--input-json")
 
 
 def _load_json(path):
@@ -83,6 +96,54 @@ def read_config():
     return servers
 
 
+# --- Tools cache (powers shell completion) ---
+
+def _cache_path(server):
+    """Disk path for a server's cached tool list."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", server)
+    return os.path.join(CACHE_DIR, f"tools-{safe}.json")
+
+
+def _cache_write(server, tools):
+    """Atomically persist a server's tool list. Never raises."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        path = _cache_path(server)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"ts": int(time.time()), "tools": tools}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # cache writes are best-effort; never break the main flow
+
+
+def _cache_read(server):
+    """Return cached tools for a server (possibly stale), or empty list."""
+    try:
+        with open(_cache_path(server)) as f:
+            return json.load(f).get("tools", [])
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _cache_clear(server=None):
+    """Remove cache for one server, or all if server is None."""
+    if not os.path.isdir(CACHE_DIR):
+        return
+    if server:
+        try:
+            os.remove(_cache_path(server))
+        except FileNotFoundError:
+            pass
+        return
+    for name in os.listdir(CACHE_DIR):
+        if name.startswith("tools-") and name.endswith(".json"):
+            try:
+                os.remove(os.path.join(CACHE_DIR, name))
+            except OSError:
+                pass
+
+
 def parse_value(val):
     """Parse string value to appropriate type."""
     try:
@@ -114,6 +175,9 @@ def parse_args():
         print("       mcp-call --add-http <name> <url>", file=sys.stderr)
         print("       mcp-call --remove <name>", file=sys.stderr)
         print("       mcp-call --sync", file=sys.stderr)
+        print("       mcp-call --completion <bash|zsh|fish>", file=sys.stderr)
+        print("       mcp-call --refresh-completions      (cache tool lists for tab completion)", file=sys.stderr)
+        print("       mcp-call --clear-cache [server]", file=sys.stderr)
         sys.exit(0 if args else 1)
 
     if args[0] == "--servers":
@@ -141,6 +205,13 @@ def parse_args():
         return "__remove__", args[1], {}
     if args[0] == "--sync":
         return "__sync__", None, {}
+    if args[0] == "--completion":
+        shell = args[1] if len(args) > 1 else "bash"
+        return "__completion__", shell, {}
+    if args[0] == "--refresh-completions":
+        return "__refresh_completions__", None, {}
+    if args[0] == "--clear-cache":
+        return "__clear_cache__", args[1] if len(args) > 1 else None, {}
 
     server = args[0]
     if len(args) < 2 or args[1] == "--tools":
@@ -421,29 +492,32 @@ def stdio_call_tool(proc, tool_name, tool_args):
 
 # --- Tool discovery ---
 
-def fetch_tools(config):
-    """Fetch tools list from server (HTTP or stdio)."""
+def fetch_tools(config, server_name=""):
+    """Fetch tools list from server (HTTP or stdio), caching for completion."""
+    tools = []
     if is_http(config):
         session = HttpSession(config["url"], config.get("headers"))
         http_init(session)
         resp = session.rpc("tools/list", {}, msg_id=2)
-        if not resp or "result" not in resp:
-            return []
-        return resp["result"].get("tools", [])
-    proc = spawn_server(config)
-    try:
-        init_server(proc)
-        send(proc, "tools/list", {}, msg_id=2)
-        resp = recv(proc, expected_id=2)
-        if not resp or "result" not in resp:
-            return []
-        return resp["result"].get("tools", [])
-    finally:
-        proc.terminate()
+        if resp and "result" in resp:
+            tools = resp["result"].get("tools", [])
+    else:
+        proc = spawn_server(config)
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            init_server(proc)
+            send(proc, "tools/list", {}, msg_id=2)
+            resp = recv(proc, expected_id=2)
+            if resp and "result" in resp:
+                tools = resp["result"].get("tools", [])
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    if server_name and tools:
+        _cache_write(server_name, tools)
+    return tools
 
 
 def _colors():
@@ -658,13 +732,139 @@ def sync_from_claude():
     print(f"Synced: {added} new servers added, {len(current)} total")
 
 
+def refresh_completions():
+    """Fetch tools/list from every configured server and cache results."""
+    servers = read_config()
+    ok, fail = 0, 0
+    for name, cfg in servers.items():
+        try:
+            tools = fetch_tools(cfg, name)
+            if tools:
+                ok += 1
+                print(f"  ✓ {name}: {len(tools)} tools cached")
+            else:
+                fail += 1
+                print(f"  · {name}: no tools returned", file=sys.stderr)
+        except SystemExit:
+            # fetch_tools may sys.exit on auth errors; catch to keep going
+            fail += 1
+            print(f"  ✗ {name}: failed", file=sys.stderr)
+        except Exception as e:
+            fail += 1
+            print(f"  ✗ {name}: {e}", file=sys.stderr)
+    print(f"\nCached {ok} servers ({fail} failed)")
+
+
+# --- Shell completion ---
+
+# Bash hook — passes all prior words + the current word as the last arg.
+_BASH_COMPLETION = r"""
+_mcp_call_complete() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prior=("${COMP_WORDS[@]:1:COMP_CWORD-1}")
+    local IFS=$'\n'
+    COMPREPLY=( $(_MCP_CALL_COMPLETE=1 mcp-call "${prior[@]}" "$cur" 2>/dev/null) )
+}
+complete -F _mcp_call_complete mcp-call
+complete -F _mcp_call_complete mcp-cli-skill
+""".strip()
+
+_ZSH_COMPLETION = r"""
+#compdef mcp-call mcp-cli-skill
+_mcp_call_complete() {
+    local -a completions
+    local IFS=$'\n'
+    completions=( $(_MCP_CALL_COMPLETE=1 mcp-call "${words[@]:1}" 2>/dev/null) )
+    compadd -a completions
+}
+compdef _mcp_call_complete mcp-call
+compdef _mcp_call_complete mcp-cli-skill
+""".strip()
+
+_FISH_COMPLETION = r"""
+function __mcp_call_complete
+    set -l cmd (commandline -opc) (commandline -ct)
+    _MCP_CALL_COMPLETE=1 mcp-call $cmd[2..-1] 2>/dev/null
+end
+complete -c mcp-call -f -a "(__mcp_call_complete)"
+complete -c mcp-cli-skill -f -a "(__mcp_call_complete)"
+""".strip()
+
+
+def print_completion_script(shell):
+    """Print the shell hook the user should source/eval."""
+    scripts = {"bash": _BASH_COMPLETION, "zsh": _ZSH_COMPLETION, "fish": _FISH_COMPLETION}
+    if shell not in scripts:
+        print(f"Error: unsupported shell '{shell}'. Use bash, zsh, or fish.", file=sys.stderr)
+        sys.exit(1)
+    print(scripts[shell])
+
+
+def _completion_candidates(prior, partial):
+    """Return candidate completions given the prior args and the partial word.
+
+    Position is determined by *non-flag* prior args:
+      - 0 positionals  -> server names + top-level meta flags
+      - 1 positional   -> tool names for that server + server-level flags
+      - >=2 positionals -> flag names for that tool from cached schema
+
+    Special-cased meta flags that expect a specific kind of next arg
+    short-circuit the positional logic.
+    """
+    # Meta flags whose immediate next arg has a fixed shape — suggest
+    # only those, not random server/tool names.
+    if prior == ["--remove"] or prior == ["--clear-cache"]:
+        return list(_load_json(CONFIG_PATH).keys())
+    if prior == ["--completion"]:
+        return ["bash", "zsh", "fish"]
+    # --add / --add-http take free-form command/URL/headers — nothing useful to suggest.
+    if prior and prior[0] in ("--add", "--add-http"):
+        return []
+
+    positional = [a for a in prior if not a.startswith("-")]
+
+    if not positional:
+        servers = _load_json(CONFIG_PATH)
+        return list(servers.keys()) + list(META_FLAGS)
+
+    server = positional[0]
+    if len(positional) == 1:
+        tools = _cache_read(server)
+        return [t["name"] for t in tools if t.get("name")] + list(SERVER_FLAGS)
+
+    tool_name = positional[1]
+    tools = _cache_read(server)
+    for t in tools:
+        if t.get("name") == tool_name:
+            props = (t.get("inputSchema") or {}).get("properties") or {}
+            return [f"--{k}" for k in props] + list(TOOL_FLAGS)
+    return list(TOOL_FLAGS)
+
+
+def do_completion():
+    """Print newline-separated completion candidates matching the partial word."""
+    # The shell hook appends the partial (possibly empty) as the last arg.
+    args = sys.argv[1:]
+    if not args:
+        partial, prior = "", []
+    else:
+        partial, prior = args[-1], args[:-1]
+    try:
+        for cand in _completion_candidates(prior, partial):
+            if cand.startswith(partial):
+                print(cand)
+    except Exception:
+        # Never let completion errors leak into the user's terminal.
+        pass
+
+
 # --- Main ---
 
 def run_server(config, tool_name, tool_args, server_name=""):
     """Route to HTTP or stdio transport."""
     # tool discovery commands
     if tool_name in ("__tools__", "__discover__", "__schema__", "__help__"):
-        tools = fetch_tools(config)
+        tools = fetch_tools(config, server_name)
         if tool_name == "__tools__":
             _print_tools(tools)
         elif tool_name == "__discover__":
@@ -705,6 +905,12 @@ def run_server(config, tool_name, tool_args, server_name=""):
 
 
 def main():
+    # Shell completion is the fast path — runs on every TAB. Handle it
+    # before read_config() (which can print "Seeded..." to stderr).
+    if os.environ.get("_MCP_CALL_COMPLETE"):
+        do_completion()
+        return
+
     servers = read_config()
     server_name, tool_name, tool_args = parse_args()
 
@@ -722,6 +928,16 @@ def main():
         return
     if server_name == "__sync__":
         sync_from_claude()
+        return
+    if server_name == "__completion__":
+        print_completion_script(tool_name)
+        return
+    if server_name == "__refresh_completions__":
+        refresh_completions()
+        return
+    if server_name == "__clear_cache__":
+        _cache_clear(tool_name)
+        print(f"Cleared cache{' for ' + tool_name if tool_name else ''}.")
         return
 
     if server_name not in servers:

@@ -24,6 +24,9 @@ mcp-call --add <name> <cmd> [args] [--env K=V ...]    # add stdio server
 mcp-call --add-http <name> <url>                      # add HTTP server
 mcp-call --remove <name>                              # remove server
 mcp-call --sync                                       # re-sync from Claude configs
+mcp-call --completion <bash|zsh|fish>                 # print shell completion hook
+mcp-call --refresh-completions                        # cache tool lists for tab completion
+mcp-call --clear-cache [server]                       # bust the completion cache
 ```
 
 ## Server Management
