@@ -40,7 +40,11 @@ mcp-call --sync    # re-sync from Claude configs
 
 ## Shell completion
 
-Tab completion suggests server names, tool names, and flag names (no MCP roundtrip — reads a local cache).
+Tab completion suggests server names, tool names, and flag names.
+
+### One-time setup (required)
+
+The shell needs to know how to ask `mcp-call` for completions. Same one-time eval pattern as `gh`, `kubectl`, `aws`:
 
 ```bash
 # bash — add to ~/.bashrc
@@ -51,13 +55,22 @@ eval "$(mcp-call --completion zsh)"
 
 # fish — write once
 mcp-call --completion fish > ~/.config/fish/completions/mcp-call.fish
-
-# Populate the tool cache once (or re-run after server changes):
-mcp-call --refresh-completions
-mcp-call --clear-cache [server]
 ```
 
-The cache lives at `~/.mcp-cli/cache/tools-<server>.json` and is also refreshed whenever you run `mcp-call <server> --tools`.
+After this, `mcp-call <TAB>` immediately suggests server names (read live from `~/.mcp-cli/servers.json` — no cache involved).
+
+### Tool-level completion (optional refresh)
+
+`mcp-call <server> <TAB>` and `mcp-call <server> <tool> --<TAB>` read from a disk cache at `~/.mcp-cli/cache/tools-<server>.json`. The cache exists because fetching a server's tool list takes 200ms–1s (subprocess spawn or HTTP roundtrip) — too slow for TAB.
+
+The cache populates **automatically** whenever you run `--tools`, `--discover`, `--help`, or `--schema`. So tool completion "just works" for any server you've used.
+
+For instant completion on every server up front:
+
+```bash
+mcp-call --refresh-completions   # walks every configured server, caches its tools
+mcp-call --clear-cache [server]  # bust a stale entry, or all entries
+```
 
 ### Environment variables
 
