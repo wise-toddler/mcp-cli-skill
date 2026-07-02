@@ -770,15 +770,18 @@ complete -F _mcp_call_complete mcp-cli-skill
 """.strip()
 
 _ZSH_COMPLETION = r"""
-#compdef mcp-call mcp-cli-skill
+# Ensure zsh completion system is loaded (safe to run more than once).
+if ! type compdef >/dev/null 2>&1; then
+    autoload -U +X compinit && compinit -u 2>/dev/null
+fi
 _mcp_call_complete() {
     local -a completions
     local IFS=$'\n'
-    completions=( $(_MCP_CALL_COMPLETE=1 mcp-call "${words[@]:1}" 2>/dev/null) )
+    completions=( ${(f)"$(_MCP_CALL_COMPLETE=1 mcp-call "${words[@]:1}" 2>/dev/null)"} )
     compadd -a completions
 }
-compdef _mcp_call_complete mcp-call
-compdef _mcp_call_complete mcp-cli-skill
+compdef _mcp_call_complete mcp-call 2>/dev/null
+compdef _mcp_call_complete mcp-cli-skill 2>/dev/null
 """.strip()
 
 _FISH_COMPLETION = r"""
