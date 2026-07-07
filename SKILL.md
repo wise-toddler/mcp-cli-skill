@@ -21,7 +21,7 @@ mcp-call <server> <tool> --key=value ...              # call a tool
 mcp-call <server> <tool> --input-json '{"key":"val"}'  # call with JSON args
 echo '{}' | mcp-call <server> <tool>                  # call with stdin JSON
 mcp-call --add <name> <cmd> [args] [--env K=V ...]    # add stdio server
-mcp-call --add-http <name> <url>                      # add HTTP server
+mcp-call --add-http <name> <url> [--header 'K: V' ...] # add HTTP server (auth via --header/-H)
 mcp-call --remove <name>                              # remove server
 mcp-call --sync                                       # re-sync from Claude configs
 mcp-call --completion <bash|zsh|fish>                 # print shell completion hook
