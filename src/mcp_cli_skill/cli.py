@@ -186,17 +186,24 @@ def parse_args():
         return "__add__", None, {"_raw": args[1:]}
     if args[0] == "--add-http":
         if len(args) < 3:
-            print("Usage: mcp-call --add-http <name> <url> [-H 'Key: Value' ...]", file=sys.stderr)
+            print("Usage: mcp-call --add-http <name> <url> [-H|--header 'Key: Value' ...]", file=sys.stderr)
             sys.exit(1)
         add_args = {"url": args[2], "headers": {}}
         i = 3
         while i < len(args):
-            if args[i] == "-H" and i + 1 < len(args):
+            a = args[i]
+            if a in ("-H", "--header") and i + 1 < len(args):
                 k, v = args[i + 1].split(":", 1)
                 add_args["headers"][k.strip()] = v.strip()
                 i += 2
-            else:
+            elif a.startswith("--header=") or a.startswith("-H="):
+                _, v = a.split("=", 1)
+                k, v = v.split(":", 1)
+                add_args["headers"][k.strip()] = v.strip()
                 i += 1
+            else:
+                print(f"Error: unknown flag {a!r} for --add-http. Use -H or --header 'Key: Value'.", file=sys.stderr)
+                sys.exit(1)
         return "__add_http__", args[1], add_args
     if args[0] == "--remove":
         if len(args) < 2:
