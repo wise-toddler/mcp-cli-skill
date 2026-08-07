@@ -292,7 +292,10 @@ class HttpSession:
         self.session_id = None
         self.extra_headers = {k: _expand_env(v) for k, v in (extra_headers or {}).items()}
 
-    def _send(self, data, headers, timeout=30, max_redirects=3):
+    def _send(self, data, headers, timeout=None, max_redirects=3):
+        # Long-running tool calls (bash, LLM, etc) can exceed 30s; make it tunable.
+        if timeout is None:
+            timeout = int(os.environ.get("MCP_CALL_HTTP_TIMEOUT", "300"))
         """POST data and follow 307/308 redirects preserving method+body.
 
         urllib's default HTTPRedirectHandler does NOT follow 307/308 on POST,
@@ -353,6 +356,10 @@ class HttpSession:
             sys.exit(1)
         except urllib.error.URLError as e:
             print(f"Error: cannot connect to {self.url}: {e.reason}", file=sys.stderr)
+            sys.exit(1)
+        except TimeoutError:
+            # urlopen raises bare TimeoutError in Python 3.10+, not URLError.
+            print(f"Error: request to {self.url} timed out. Set MCP_CALL_HTTP_TIMEOUT=<sec> for longer.", file=sys.stderr)
             sys.exit(1)
 
     def notify(self, method, params=None):
