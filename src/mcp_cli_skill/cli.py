@@ -165,7 +165,7 @@ def parse_args():
                     break
         sys.exit(0)
     if not args or args[0] in ("-h", "--help"):
-        print("Usage: mcp-call <server> <tool> [--key=value ...] [--input-json '{...}']", file=sys.stderr)
+        print("Usage: mcp-call <server> <tool> [--key=value ...] [--input-json '{...}'] [-- <tool params verbatim>]", file=sys.stderr)
         print("       mcp-call --servers", file=sys.stderr)
         print("       mcp-call <server> --tools", file=sys.stderr)
         print("       mcp-call <server> --discover", file=sys.stderr)
@@ -229,17 +229,20 @@ def parse_args():
     tool = args[1]
     tool_args = {}
     i = 2
+    verbatim = False  # after a bare `--`, everything is tool params, never meta-flags
     while i < len(args):
         arg = args[i]
-        if arg == "--schema":
+        if not verbatim and arg == "--":
+            verbatim = True
+        elif not verbatim and arg == "--schema":
             return server, "__schema__", {"_tool": tool}
-        elif arg in ("--help", "-h"):
+        elif not verbatim and arg in ("--help", "-h"):
             return server, "__help__", {"_tool": tool}
-        elif arg == "--input-json" and i + 1 < len(args):
+        elif not verbatim and arg == "--input-json" and i + 1 < len(args):
             tool_args.update(json.loads(args[i + 1]))
             i += 2
             continue
-        elif arg.startswith("--input-json="):
+        elif not verbatim and arg.startswith("--input-json="):
             tool_args.update(json.loads(arg[13:]))
         elif arg.startswith("--") and "=" in arg:
             key, val = arg[2:].split("=", 1)

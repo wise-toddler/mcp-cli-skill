@@ -86,3 +86,11 @@ Prefer this over MCP tool calls when:
 ## Arg Types
 
 Values auto-parse: `--id=42` → int, `--flag=true` → bool, `--name=hello` → string.
+
+## Colliding param names
+
+If a tool has a param named `help`, `schema`, or `input-json` (which clash with mcp-call's own flags), pass it after `--`:
+
+```bash
+mcp-call srv tool --id=5 -- --help=true --schema=foo   # everything after -- goes to the tool verbatim
+```
