@@ -275,6 +275,22 @@ def _print_content(items):
             os.write(fd, base64.b64decode(item["data"]))
             os.close(fd)
             print(path)
+        elif item.get("type") == "resource_link":
+            line = item.get("uri", "")
+            if item.get("name"):
+                line += f"  ({item['name']})"
+            print(line)
+
+
+def _print_result(result):
+    """Print a tools/call result; exit 1 if the tool flagged an error."""
+    content = result.get("content", [])
+    _print_content(content)
+    # structured-only results (empty content) would otherwise print nothing
+    if not content and result.get("structuredContent") is not None:
+        print(json.dumps(result["structuredContent"], indent=2, default=str))
+    if result.get("isError"):
+        sys.exit(1)
 
 
 def _expand_env(val):
@@ -413,7 +429,7 @@ def http_call_tool(url, tool_name, tool_args, extra_headers=None):
     if "error" in resp:
         print(json.dumps(resp["error"], indent=2), file=sys.stderr)
         sys.exit(1)
-    _print_content(resp.get("result", {}).get("content", []))
+    _print_result(resp.get("result", {}))
 
 
 # --- Stdio transport ---
@@ -501,7 +517,7 @@ def stdio_call_tool(proc, tool_name, tool_args):
     if "error" in resp:
         print(json.dumps(resp["error"], indent=2), file=sys.stderr)
         sys.exit(1)
-    _print_content(resp.get("result", {}).get("content", []))
+    _print_result(resp.get("result", {}))
 
 
 # --- Tool discovery ---
@@ -512,17 +528,33 @@ def fetch_tools(config, server_name=""):
     if is_http(config):
         session = HttpSession(config["url"], config.get("headers"))
         http_init(session)
-        resp = session.rpc("tools/list", {}, msg_id=2)
-        if resp and "result" in resp:
-            tools = resp["result"].get("tools", [])
+        cursor, msg_id = None, 2
+        while True:
+            params = {"cursor": cursor} if cursor else {}
+            resp = session.rpc("tools/list", params, msg_id=msg_id)
+            if not resp or "result" not in resp:
+                break
+            tools += resp["result"].get("tools", [])
+            cursor = resp["result"].get("nextCursor")
+            if not cursor:
+                break
+            msg_id += 1
     else:
         proc = spawn_server(config)
         try:
             init_server(proc)
-            send(proc, "tools/list", {}, msg_id=2)
-            resp = recv(proc, expected_id=2)
-            if resp and "result" in resp:
-                tools = resp["result"].get("tools", [])
+            cursor, msg_id = None, 2
+            while True:
+                params = {"cursor": cursor} if cursor else {}
+                send(proc, "tools/list", params, msg_id=msg_id)
+                resp = recv(proc, expected_id=msg_id)
+                if not resp or "result" not in resp:
+                    break
+                tools += resp["result"].get("tools", [])
+                cursor = resp["result"].get("nextCursor")
+                if not cursor:
+                    break
+                msg_id += 1
         finally:
             proc.terminate()
             try:
@@ -536,7 +568,7 @@ def fetch_tools(config, server_name=""):
 
 def _colors():
     """Return ANSI color codes if stdout is a TTY, else empty strings."""
-    on = sys.stdout.isatty()
+    on = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     return {
         "bold": "\033[1m" if on else "",
         "dim": "\033[2m" if on else "",
