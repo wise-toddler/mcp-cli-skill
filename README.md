@@ -172,3 +172,13 @@ The key insight: an LLM agent writes this script in one shot, runs it via its Ba
 ## How it works
 
 Reads MCP server config from `~/.mcp-cli/servers.json` (standalone, agent-agnostic). On first run, seeds from `~/.claude/settings.json` and `~/.claude.json`. For stdio servers, spawns the server as a subprocess and speaks JSON-RPC over stdin/stdout. For HTTP servers, sends JSON-RPC over HTTP with session ID tracking. Zero dependencies — pure Python stdlib.
+
+## Releasing
+
+Bump `__version__` in `src/mcp_cli_skill/__init__.py`, sync `scripts/mcp_call.py`, commit, then push a matching tag:
+
+```bash
+git tag v0.8.5 && git push origin v0.8.5
+```
+
+CI runs the tests, checks the tag matches `__version__`, and publishes to PyPI via Trusted Publishing (no token).
