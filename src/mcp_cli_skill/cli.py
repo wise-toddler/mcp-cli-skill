@@ -57,9 +57,10 @@ def _load_json(path):
 
 
 def _save_config(servers):
-    """Save servers to standalone config."""
+    """Save servers to standalone config (mode 0600: headers may hold tokens)."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
+    with os.fdopen(os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        os.chmod(CONFIG_PATH, 0o600)  # also tightens a config written before 0600
         json.dump(servers, f, indent=2)
 
 
