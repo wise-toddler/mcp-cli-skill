@@ -14,7 +14,7 @@ Always use `mcp-call` as the command, never `uvx mcp-cli-skill`.
 
 ```bash
 mcp-call --servers                                    # list configured servers
-mcp-call <server> --tools                             # list tools (human-readable)
+mcp-call <server> --tools                             # list tools (human-readable; --list / --help work too)
 mcp-call <server> --discover                          # list tools as JSON with schemas
 mcp-call <server> <tool> --schema                     # show tool's input schema as JSON
 mcp-call <server> <tool> --key=value ...              # call a tool
@@ -41,6 +41,8 @@ mcp-call --add github npx @modelcontextprotocol/server-github --env GITHUB_TOKEN
 mcp-call --remove myredash
 mcp-call --sync
 ```
+
+An unknown option or tool name exits 2 with a "Did you mean" hint and is never sent to the server — use the hint instead of guessing another name.
 
 If a call exits 4 with "needs interactive browser login", ask the user to run the `mcp-call --login <name>` command it prints; don't run it yourself.
 

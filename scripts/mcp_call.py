@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Call any MCP server tool from CLI with --flag=value args."""
 import base64
+import difflib
 import hashlib
 import http.server
 import json
@@ -246,10 +247,17 @@ def parse_args():
     # `mcp-call <server> --login|--logout` alias the top-level flags
     if len(args) > 1 and args[1] in ("--login", "--logout"):
         return f"__{args[1][2:]}__", server, {"no_browser": "--no-browser" in args[2:]}
-    if len(args) < 2 or args[1] == "--tools":
+    # --list / --help / -h are what people (and agents) guess for "list tools"
+    if len(args) < 2 or args[1] in ("--tools", "--list", "--help", "-h"):
         return server, "__tools__", {}
     if args[1] == "--discover":
         return server, "__discover__", {}
+    if args[1].startswith("-"):
+        # MCP tool names never start with "-": a mistyped option, so never send it to the server
+        close = difflib.get_close_matches(args[1], ["--tools", "--discover", "--login", "--logout"], n=1)
+        hint = f" Did you mean {close[0]}?" if close else ""
+        print(f"Error: unknown option '{args[1]}'.{hint} List tools with: mcp-call {server} --tools", file=sys.stderr)
+        sys.exit(2)
 
     tool = args[1]
     tool_args = {}
@@ -1284,6 +1292,14 @@ def do_completion():
 
 # --- Main ---
 
+def _unknown_tool(server_name, tool_name, names):
+    """Exit 2 with close-match suggestions for a tool name the server doesn't have."""
+    close = difflib.get_close_matches(tool_name, names, n=3, cutoff=0.4)
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    print(f"Error: unknown tool '{tool_name}' for {server_name}.{hint} List tools with: mcp-call {server_name} --tools", file=sys.stderr)
+    sys.exit(2)
+
+
 def run_server(config, tool_name, tool_args, server_name=""):
     """Route to HTTP or stdio transport."""
     # tool discovery commands
@@ -1301,18 +1317,21 @@ def run_server(config, tool_name, tool_args, server_name=""):
                 if t["name"] == target:
                     print(json.dumps(t.get("inputSchema", {}), indent=2))
                     return
-            print(f"Error: tool '{target}' not found", file=sys.stderr)
-            sys.exit(1)
+            _unknown_tool(server_name, target, [t["name"] for t in tools])
         elif tool_name == "__help__":
             target = tool_args["_tool"]
             for t in tools:
                 if t["name"] == target:
                     _print_tool_help(server_name or "<server>", t)
                     return
-            print(f"Error: tool '{target}' not found", file=sys.stderr)
-            sys.exit(1)
+            _unknown_tool(server_name, target, [t["name"] for t in tools])
         return
-    # tool calls
+    # tool calls: a name missing from the cached list is a typo or a newly added tool,
+    # so re-fetch once (refreshes the cache) and only refuse if the server lacks it too
+    if server_name and tool_name not in [t.get("name") for t in _cache_read(server_name)]:
+        names = [t.get("name") for t in fetch_tools(config, server_name)]
+        if names and tool_name not in names:  # empty list = server can't list tools; let the call decide
+            _unknown_tool(server_name, tool_name, names)
     if is_http(config):
         http_call_tool(config["url"], tool_name, tool_args, config.get("headers"), server_name)
     else:
