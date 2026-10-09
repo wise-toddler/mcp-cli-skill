@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Call any MCP server tool from CLI with --flag=value args."""
 import base64
+import contextlib
 import difflib
 import hashlib
 import http.server
@@ -48,6 +49,14 @@ SERVER_FLAGS = ("--tools", "--discover", "--help")
 TOOL_FLAGS = ("--help", "--schema", "--input-json")
 
 
+class McpError(Exception):
+    """Fatal error from library code; main() prints msg to stderr and exits with code."""
+
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.msg, self.code = msg, code
+
+
 def _load_json(path):
     """Load JSON file if it exists."""
     if os.path.exists(path):
@@ -57,9 +66,10 @@ def _load_json(path):
 
 
 def _save_config(servers):
-    """Save servers to standalone config."""
+    """Save servers to standalone config (mode 0600: headers may hold tokens)."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
+    with os.fdopen(os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        os.chmod(CONFIG_PATH, 0o600)  # also tightens a config written before 0600
         json.dump(servers, f, indent=2)
 
 
@@ -453,26 +463,22 @@ class HttpSession:
                     if self._oauth_token:
                         return self.rpc(method, params, msg_id, _retried=True)
                 if self._oauth_token:
-                    print(f"Error: {name} rejected a freshly refreshed token (HTTP 401). Ask the user to run: mcp-call --logout {name} && mcp-call --login {name}", file=sys.stderr)
-                    sys.exit(EXIT_NEEDS_LOGIN)
+                    raise McpError(f"Error: {name} rejected a freshly refreshed token (HTTP 401). Ask the user to run: mcp-call --logout {name} && mcp-call --login {name}", EXIT_NEEDS_LOGIN)
                 if "resource_metadata=" in e.headers.get("WWW-Authenticate", ""):
-                    print(f"Error: {name} needs interactive browser login. Ask the user to run: mcp-call --login {name} (do not run it yourself; it opens a browser).", file=sys.stderr)
-                    sys.exit(EXIT_NEEDS_LOGIN)
-            print(f"Error: HTTP {e.code} from {self.url}", file=sys.stderr)
+                    raise McpError(f"Error: {name} needs interactive browser login. Ask the user to run: mcp-call --login {name} (do not run it yourself; it opens a browser).", EXIT_NEEDS_LOGIN)
+            msg = f"Error: HTTP {e.code} from {self.url}"
             if body.strip():
                 # strip HTML, show first 200 chars
                 clean = body.strip()
                 if "<html" in clean.lower():
                     clean = "Server returned HTML error page (auth required?)"
-                print(clean[:500], file=sys.stderr)
-            sys.exit(1)
+                msg += "\n" + clean[:500]
+            raise McpError(msg)
         except urllib.error.URLError as e:
-            print(f"Error: cannot connect to {self.url}: {e.reason}", file=sys.stderr)
-            sys.exit(1)
+            raise McpError(f"Error: cannot connect to {self.url}: {e.reason}")
         except TimeoutError:
             # urlopen raises bare TimeoutError in Python 3.10+, not URLError.
-            print(f"Error: request to {self.url} timed out. Set MCP_CALL_HTTP_TIMEOUT=<sec> for longer.", file=sys.stderr)
-            sys.exit(1)
+            raise McpError(f"Error: request to {self.url} timed out. Set MCP_CALL_HTTP_TIMEOUT=<sec> for longer.")
 
     def notify(self, method, params=None):
         """Send JSON-RPC notification (no id, ignore response)."""
@@ -489,6 +495,15 @@ class HttpSession:
         except Exception:
             pass
 
+    def close(self):
+        """No-op: each request opens and closes its own connection."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
 
 def _parse_sse(body, expected_id):
     """Parse SSE response and extract JSON-RPC message matching expected_id."""
@@ -503,31 +518,6 @@ def _parse_sse(body, expected_id):
     return None
 
 
-def http_init(session):
-    """Initialize HTTP MCP server."""
-    session.rpc("initialize", {
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": {"name": "mcp-cli", "version": "1.0"}
-    }, msg_id=1)
-    session.notify("notifications/initialized")
-
-
-
-def http_call_tool(url, tool_name, tool_args, extra_headers=None, server_name=None):
-    """Call a tool on HTTP MCP server."""
-    session = HttpSession(url, extra_headers, server_name)
-    http_init(session)
-    resp = session.rpc("tools/call", {"name": tool_name, "arguments": tool_args}, msg_id=3)
-    if not resp:
-        print("Error: no response", file=sys.stderr)
-        sys.exit(1)
-    if "error" in resp:
-        print(json.dumps(resp["error"], indent=2), file=sys.stderr)
-        sys.exit(1)
-    _print_result(resp.get("result", {}))
-
-
 # --- OAuth ---
 # Browser login via discovery + dynamic client registration + PKCE; tokens never printed.
 
@@ -535,9 +525,8 @@ _tokens_warned = False  # warn about a corrupt tokens.json once per run
 
 
 def _die(msg, code=1):
-    """Print msg to stderr and exit."""
-    print(msg, file=sys.stderr)
-    sys.exit(code)
+    """Raise McpError; main() prints msg to stderr and exits with code."""
+    raise McpError(msg, code)
 
 
 def _clean(text):
@@ -885,48 +874,81 @@ def spawn_server(config):
 
 
 def check_alive(proc):
-    """Check if server process is still running, print stderr if dead."""
+    """Check if server process is still running; raise McpError with its stderr if dead."""
     if proc.poll() is not None:
         stderr = proc.stderr.read() if proc.stderr else ""
-        print(f"Error: server exited with code {proc.returncode}", file=sys.stderr)
+        msg = f"Error: server exited with code {proc.returncode}"
         if stderr.strip():
-            print(stderr.strip(), file=sys.stderr)
-        sys.exit(1)
+            msg += "\n" + stderr.strip()
+        raise McpError(msg)
 
 
-def init_server(proc):
-    """Initialize stdio MCP handshake."""
-    check_alive(proc)
-    try:
-        send(proc, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "mcp-cli", "version": "1.0"}
-        }, msg_id=1)
-        resp = recv(proc, expected_id=1)
+class StdioSession:
+    """Stdio MCP server process behind the same rpc/notify interface as HttpSession."""
+
+    def __init__(self, config):
+        self.proc = spawn_server(config)
+
+    def rpc(self, method, params=None, msg_id=1):
+        """Send JSON-RPC request via stdio and return the matching response (None if none)."""
+        send(self.proc, method, params, msg_id=msg_id)
+        return recv(self.proc, expected_id=msg_id)
+
+    def notify(self, method, params=None):
+        """Send JSON-RPC notification (no id, no response)."""
+        send(self.proc, method, params)
+
+    def close(self):
+        """Stop the server: terminate, then kill if it hasn't exited within 5s."""
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+@contextlib.contextmanager
+def _open_session(config, server_name=""):
+    """Yield an HTTP or stdio session after the initialize handshake; closes it on exit."""
+    stdio = not is_http(config)
+    session = StdioSession(config) if stdio else HttpSession(config["url"], config.get("headers"), server_name)
+    with session:
+        if stdio:
+            check_alive(session.proc)
+        try:
+            resp = session.rpc("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp-cli", "version": "1.0"}
+            }, msg_id=1)
+            # HTTP ignores the init response; a silent stdio server is dead or not speaking MCP
+            if stdio and not resp:
+                check_alive(session.proc)
+                raise McpError("Error: no response from server during init")
+            session.notify("notifications/initialized")
+        except BrokenPipeError:
+            if not stdio:
+                raise
+            check_alive(session.proc)
+            raise McpError("Error: server crashed during init")
+        yield session
+
+
+def call_tool(config, tool_name, tool_args, server_name=""):
+    """Call a tool on an HTTP or stdio server and print the result."""
+    with _open_session(config, server_name) as session:
+        resp = session.rpc("tools/call", {"name": tool_name, "arguments": tool_args}, msg_id=3)
         if not resp:
-            check_alive(proc)
-            print("Error: no response from server during init", file=sys.stderr)
-            sys.exit(1)
-        send(proc, "notifications/initialized")
-    except BrokenPipeError:
-        check_alive(proc)
-        print("Error: server crashed during init", file=sys.stderr)
-        sys.exit(1)
-
-
-
-def stdio_call_tool(proc, tool_name, tool_args):
-    """Call a tool on stdio server."""
-    send(proc, "tools/call", {"name": tool_name, "arguments": tool_args}, msg_id=3)
-    resp = recv(proc, expected_id=3)
-    if not resp:
-        print("Error: no response", file=sys.stderr)
-        sys.exit(1)
-    if "error" in resp:
-        print(json.dumps(resp["error"], indent=2), file=sys.stderr)
-        sys.exit(1)
-    _print_result(resp.get("result", {}))
+            raise McpError("Error: no response")
+        if "error" in resp:
+            raise McpError(json.dumps(resp["error"], indent=2))
+        _print_result(resp.get("result", {}))
 
 
 # --- Tool discovery ---
@@ -934,9 +956,7 @@ def stdio_call_tool(proc, tool_name, tool_args):
 def fetch_tools(config, server_name=""):
     """Fetch tools list from server (HTTP or stdio), caching for completion."""
     tools = []
-    if is_http(config):
-        session = HttpSession(config["url"], config.get("headers"), server_name)
-        http_init(session)
+    with _open_session(config, server_name) as session:
         cursor, msg_id = None, 2
         while True:
             params = {"cursor": cursor} if cursor else {}
@@ -948,28 +968,6 @@ def fetch_tools(config, server_name=""):
             if not cursor:
                 break
             msg_id += 1
-    else:
-        proc = spawn_server(config)
-        try:
-            init_server(proc)
-            cursor, msg_id = None, 2
-            while True:
-                params = {"cursor": cursor} if cursor else {}
-                send(proc, "tools/list", params, msg_id=msg_id)
-                resp = recv(proc, expected_id=msg_id)
-                if not resp or "result" not in resp:
-                    break
-                tools += resp["result"].get("tools", [])
-                cursor = resp["result"].get("nextCursor")
-                if not cursor:
-                    break
-                msg_id += 1
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
     if server_name and tools:
         _cache_write(server_name, tools)
     return tools
@@ -1217,8 +1215,10 @@ def refresh_completions():
             else:
                 fail += 1
                 print(f"  · {name}: no tools returned", file=sys.stderr)
-        except SystemExit:
-            # fetch_tools may sys.exit on auth errors; catch to keep going
+        except McpError as e:
+            # fetch_tools raises McpError on auth/transport errors; print it and keep going
+            if e.msg:
+                print(e.msg, file=sys.stderr)
             fail += 1
             print(f"  ✗ {name}: failed", file=sys.stderr)
         except Exception as e:
@@ -1338,11 +1338,10 @@ def do_completion():
 # --- Main ---
 
 def _unknown_tool(server_name, tool_name, names):
-    """Exit 2 with close-match suggestions for a tool name the server doesn't have."""
+    """Raise McpError (exit 2) with close-match suggestions for a tool name the server doesn't have."""
     close = difflib.get_close_matches(tool_name, names, n=3, cutoff=0.4)
     hint = f" Did you mean: {', '.join(close)}?" if close else ""
-    print(f"Error: unknown tool '{tool_name}' for {server_name}.{hint} List tools with: mcp-call {server_name} --tools", file=sys.stderr)
-    sys.exit(2)
+    raise McpError(f"Error: unknown tool '{tool_name}' for {server_name}.{hint} List tools with: mcp-call {server_name} --tools", 2)
 
 
 def run_server(config, tool_name, tool_args, server_name=""):
@@ -1377,22 +1376,10 @@ def run_server(config, tool_name, tool_args, server_name=""):
         names = [t.get("name") for t in fetch_tools(config, server_name)]
         if names and tool_name not in names:  # empty list = server can't list tools; let the call decide
             _unknown_tool(server_name, tool_name, names)
-    if is_http(config):
-        http_call_tool(config["url"], tool_name, tool_args, config.get("headers"), server_name)
-    else:
-        proc = spawn_server(config)
-        try:
-            init_server(proc)
-            stdio_call_tool(proc, tool_name, tool_args)
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+    call_tool(config, tool_name, tool_args, server_name)
 
 
-def main():
+def _main():
     # Shell completion is the fast path — runs on every TAB. Handle it
     # before read_config() (which can print "Seeded..." to stderr).
     if os.environ.get("_MCP_CALL_COMPLETE"):
@@ -1455,6 +1442,16 @@ def main():
         sys.exit(1)
 
     run_server(servers[server_name], tool_name, tool_args, server_name)
+
+
+def main():
+    """CLI entry point: a McpError from anywhere becomes its stderr message and exit code."""
+    try:
+        _main()
+    except McpError as e:
+        if e.msg:
+            print(e.msg, file=sys.stderr)
+        sys.exit(e.code)
 
 
 if __name__ == "__main__":
