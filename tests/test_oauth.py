@@ -382,6 +382,21 @@ class OAuthTest(unittest.TestCase):
         self.assertIn("browser profile", err)
         self.assertIn("Logged in to fake.", out)
 
+    def test_15_servers_lists_accounts_separately_with_login_state(self):
+        self.servers["fake-2"] = dict(self.servers["fake"])  # second account, same URL
+        cli._save_config(self.servers)
+        entry = self.seed()
+        store = {"fake": entry, "fake-2": {k: v for k, v in entry.items() if k != "access_token"}}
+        with open(cli.TOKENS_PATH, "w") as f:
+            json.dump(store, f)
+        code, out, err = self.run_cli("--servers")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("aliases", out)
+        rows = {line.split()[1]: line for line in out.splitlines() if line.strip().startswith("●")}
+        self.assertIn("logged in", rows["fake"])
+        self.assertIn("login needed", rows["fake-2"])
+        self.assertNotIn("🔑", rows["plain"])  # no OAuth entry, no marker
+
 
 if __name__ == "__main__":
     unittest.main()

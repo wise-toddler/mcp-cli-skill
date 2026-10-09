@@ -1036,10 +1036,11 @@ def is_http(config):
     return config.get("type") == "http" or "url" in config
 
 
-def _config_key(cfg):
-    """Hashable identity for a server config — used to collapse duplicates."""
+def _config_key(name, cfg):
+    """Hashable identity for a server config — used to collapse duplicate stdio servers."""
     if is_http(cfg):
-        return ("http", cfg["url"])
+        # same URL under another name is a different account or key, never an alias
+        return ("http", cfg["url"], name)
     return ("stdio", cfg.get("command", "?"), tuple(cfg.get("args", [])))
 
 
@@ -1049,15 +1050,25 @@ def _truncate(text, width):
 
 
 def list_servers(servers):
-    """Print configured servers grouped by transport, collapsing duplicates."""
+    """Print configured servers grouped by transport, collapsing duplicate stdio servers."""
     c = _colors()
     term_w = shutil.get_terminal_size((100, 24)).columns
     # split + group by config identity
     http_groups, stdio_groups = {}, {}
     for name, cfg in servers.items():
         bucket = http_groups if is_http(cfg) else stdio_groups
-        bucket.setdefault(_config_key(cfg), []).append(name)
+        bucket.setdefault(_config_key(name, cfg), []).append(name)
     max_name = min(max((len(n) for n in servers), default=20), 28)
+    tokens = _tokens_read()  # local file only; no network
+
+    def login_mark(name):
+        """'🔑 logged in' / '🔑 login needed' for servers with an OAuth entry, else ''."""
+        entry, cfg = tokens.get(name), servers[name]
+        if entry is None or not is_http(cfg):
+            return "", ""
+        if entry.get("access_token") and _norm_url(entry.get("url", "")) == _norm_url(_expand_env(cfg["url"])):
+            return "🔑 logged in", c["green"]
+        return "🔑 login needed", c["yellow"]
 
     def print_group(label, color, groups, target_fn):
         total = sum(len(v) for v in groups.values())
@@ -1069,12 +1080,15 @@ def list_servers(servers):
             names_sorted = sorted(names)
             primary = names_sorted[0]
             target = target_fn(key)
+            mark, mark_color = login_mark(primary)
             # compute remaining width for the target
             base = f"  ● {primary:<{max_name}}  "
             visible_len = len(base)
-            avail = max(20, term_w - visible_len - 4)
+            avail = max(20, term_w - visible_len - 4 - (len(mark) + 2 if mark else 0))
             target_disp = _truncate(target, avail)
             line = f"  {c['green']}●{c['reset']} {c['bold']}{primary:<{max_name}}{c['reset']}  {c['dim']}{target_disp}{c['reset']}"
+            if mark:
+                line += f"  {mark_color}{mark}{c['reset']}"
             if len(names_sorted) > 1:
                 line += f"  {c['yellow']}×{len(names_sorted)}{c['reset']}"
             print(line)
