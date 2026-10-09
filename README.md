@@ -38,6 +38,19 @@ mcp-call --remove myserver
 mcp-call --sync    # re-sync from Claude configs
 ```
 
+## OAuth servers
+
+HTTP servers that use MCP OAuth (dynamic client registration + PKCE) need a one-time browser login:
+
+```bash
+mcp-call --add-http emergent https://mcp.emergent.sh/
+mcp-call --login emergent     # opens the browser; approve, then "Logged in to emergent."
+mcp-call emergent --tools     # bearer token is sent and refreshed automatically
+mcp-call --logout emergent    # forget the local tokens (no server-side revocation)
+```
+
+Tokens live in `~/.mcp-cli/tokens.json` (mode 0600), bound to the server's URL. A call to a server that needs login exits with code 4 and says which `--login` to run. `--login` waits up to `MCP_CALL_LOGIN_TIMEOUT` seconds (default 300) for the browser; over SSH it prints the URL instead of opening a browser. A static `Authorization` header (`--header`) always wins over OAuth.
+
 ## Shell completion
 
 Tab completion suggests server names, tool names, and flag names.

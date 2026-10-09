@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """Call any MCP server tool from CLI with --flag=value args."""
 import base64
+import hashlib
+import http.server
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
+import threading
 import re
 import shutil
 import time
 import urllib.parse
 import urllib.request
 import urllib.error
+import webbrowser
+
+try:
+    import fcntl
+except ImportError:  # Windows: the token store runs without a lock
+    fcntl = None
 
 MCP_CALL_TMPDIR = os.path.join(tempfile.gettempdir(), "mcp-call")
 CONFIG_DIR = os.path.expanduser("~/.mcp-cli")
@@ -19,10 +29,15 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "servers.json")
 CACHE_DIR = os.path.join(CONFIG_DIR, "cache")
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")  # OAuth tokens, mode 0600
+LOGIN_TIMEOUT = int(os.environ.get("MCP_CALL_LOGIN_TIMEOUT") or 300)  # seconds --login waits for the browser
+OAUTH_HTTP_TIMEOUT = 30  # every OAuth request gets an explicit timeout
+EXIT_NEEDS_LOGIN = 4  # exit code when the user must run --login
 
 # CLI flags that don't take a positional server/tool — used for completion.
 META_FLAGS = (
     "--servers", "--sync", "--add", "--add-http", "--remove",
+    "--login", "--logout",
     "--completion", "--refresh-completions", "--clear-cache",
     "--version", "--help",
 )
@@ -174,6 +189,8 @@ def parse_args():
         print("       mcp-call --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
         print("       mcp-call --add-http <name> <url>", file=sys.stderr)
         print("       mcp-call --remove <name>", file=sys.stderr)
+        print("       mcp-call --login <name>             (OAuth browser login for an HTTP server)", file=sys.stderr)
+        print("       mcp-call --logout <name>            (forget stored OAuth tokens)", file=sys.stderr)
         print("       mcp-call --sync", file=sys.stderr)
         print("       mcp-call --completion <bash|zsh|fish>", file=sys.stderr)
         print("       mcp-call --refresh-completions      (cache tool lists for tab completion)", file=sys.stderr)
@@ -210,6 +227,11 @@ def parse_args():
             print("Usage: mcp-call --remove <name>", file=sys.stderr)
             sys.exit(1)
         return "__remove__", args[1], {}
+    if args[0] in ("--login", "--logout"):
+        if len(args) < 2:
+            print(f"Usage: mcp-call {args[0]} <name>", file=sys.stderr)
+            sys.exit(1)
+        return f"__{args[0][2:]}__", args[1], {}
     if args[0] == "--sync":
         return "__sync__", None, {}
     if args[0] == "--completion":
@@ -221,6 +243,9 @@ def parse_args():
         return "__clear_cache__", args[1] if len(args) > 1 else None, {}
 
     server = args[0]
+    # `mcp-call <server> --login|--logout` alias the top-level flags
+    if len(args) > 1 and args[1] in ("--login", "--logout"):
+        return f"__{args[1][2:]}__", server, {}
     if len(args) < 2 or args[1] == "--tools":
         return server, "__tools__", {}
     if args[1] == "--discover":
@@ -306,28 +331,41 @@ def _expand_env(val):
 class HttpSession:
     """Manages HTTP MCP session with session ID tracking."""
 
-    def __init__(self, url, extra_headers=None):
+    def __init__(self, url, extra_headers=None, server_name=None):
         self.url = _expand_env(url)
+        self.config_url = self.url  # pre-redirect URL; credentials stay on its origin
         self.session_id = None
         self.extra_headers = {k: _expand_env(v) for k, v in (extra_headers or {}).items()}
+        self.server_name = server_name
+        # a static Authorization header always wins over stored OAuth tokens
+        self.static_auth = any(k.lower() == "authorization" for k in self.extra_headers)
+        self._oauth_token = None  # bearer we sent from the token store
+        if server_name and not self.static_auth:
+            self.extra_headers.update(oauth_header(server_name, self.url))
+            self._oauth_token = self.extra_headers.get("Authorization", "").removeprefix("Bearer ") or None
 
     def _send(self, data, headers, timeout=None, max_redirects=3):
-        # Long-running tool calls (bash, LLM, etc) can exceed 30s; make it tunable.
-        if timeout is None:
-            timeout = int(os.environ.get("MCP_CALL_HTTP_TIMEOUT", "300"))
         """POST data and follow 307/308 redirects preserving method+body.
 
         urllib's default HTTPRedirectHandler does NOT follow 307/308 on POST,
         only on GET/HEAD. We handle them explicitly here.
         """
+        # Long-running tool calls (bash, LLM, etc) can exceed 30s; make it tunable.
+        if timeout is None:
+            timeout = int(os.environ.get("MCP_CALL_HTTP_TIMEOUT", "300"))
         url = self.url
         for _ in range(max_redirects + 1):
+            if _origin(url) != _origin(self.config_url):
+                # never forward credentials to another scheme/host/port
+                headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
             req = urllib.request.Request(url, data=data, headers=headers)
             try:
                 return urllib.request.urlopen(req, timeout=timeout)
             except urllib.error.HTTPError as e:
                 if e.code in (307, 308) and e.headers.get("Location"):
                     new_url = urllib.parse.urljoin(url, e.headers["Location"])
+                    if _origin(url)[0] == "https" and _origin(new_url)[0] != "https":
+                        raise  # refuse https -> http downgrade
                     try:
                         e.close()
                     except Exception:
@@ -338,7 +376,7 @@ class HttpSession:
                 raise
         raise urllib.error.HTTPError(url, 308, "Too many redirects", None, None)
 
-    def rpc(self, method, params=None, msg_id=1):
+    def rpc(self, method, params=None, msg_id=1, _retried=False):
         """Send JSON-RPC over HTTP and return response."""
         msg = {"jsonrpc": "2.0", "method": method, "id": msg_id}
         if params:
@@ -365,6 +403,22 @@ class HttpSession:
                 return json.loads(body)
         except urllib.error.HTTPError as e:
             body = e.read().decode() if e.fp else ""
+            # OAuth 401: refresh + retry once; decide on "did we send a token", not the 401's error code
+            if e.code == 401 and self.server_name and not self.static_auth and _origin(self.url) == _origin(self.config_url):
+                name = self.server_name
+                if self._oauth_token and not _retried:
+                    fresh = oauth_header(name, self.config_url, failed_token=self._oauth_token)
+                    self.extra_headers.pop("Authorization", None)
+                    self.extra_headers.update(fresh)
+                    self._oauth_token = fresh.get("Authorization", "").removeprefix("Bearer ") or None
+                    if self._oauth_token:
+                        return self.rpc(method, params, msg_id, _retried=True)
+                if self._oauth_token:
+                    print(f"Error: {name} rejected a freshly refreshed token (HTTP 401). Ask the user to run: mcp-call --logout {name} && mcp-call --login {name}", file=sys.stderr)
+                    sys.exit(EXIT_NEEDS_LOGIN)
+                if "resource_metadata=" in e.headers.get("WWW-Authenticate", ""):
+                    print(f"Error: {name} needs interactive browser login. Ask the user to run: mcp-call --login {name} (do not run it yourself; it opens a browser).", file=sys.stderr)
+                    sys.exit(EXIT_NEEDS_LOGIN)
             print(f"Error: HTTP {e.code} from {self.url}", file=sys.stderr)
             if body.strip():
                 # strip HTML, show first 200 chars
@@ -421,9 +475,9 @@ def http_init(session):
 
 
 
-def http_call_tool(url, tool_name, tool_args, extra_headers=None):
+def http_call_tool(url, tool_name, tool_args, extra_headers=None, server_name=None):
     """Call a tool on HTTP MCP server."""
-    session = HttpSession(url, extra_headers)
+    session = HttpSession(url, extra_headers, server_name)
     http_init(session)
     resp = session.rpc("tools/call", {"name": tool_name, "arguments": tool_args}, msg_id=3)
     if not resp:
@@ -433,6 +487,315 @@ def http_call_tool(url, tool_name, tool_args, extra_headers=None):
         print(json.dumps(resp["error"], indent=2), file=sys.stderr)
         sys.exit(1)
     _print_result(resp.get("result", {}))
+
+
+# --- OAuth ---
+# Browser login via discovery + dynamic client registration + PKCE; tokens never printed.
+
+_tokens_warned = False  # warn about a corrupt tokens.json once per run
+
+
+def _die(msg, code=1):
+    """Print msg to stderr and exit."""
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def _clean(text):
+    """Strip control chars from server-supplied text before printing it."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(text))[:300]
+
+
+def _origin(url):
+    """Return (scheme, host, port) of a URL for same-origin checks."""
+    p = urllib.parse.urlsplit(url)
+    return p.scheme, p.hostname, p.port or (443 if p.scheme == "https" else 80)
+
+
+def _norm_url(url):
+    """Normalize an empty URL path to '/' so https://x and https://x/ compare equal."""
+    p = urllib.parse.urlsplit(url)
+    return p._replace(path=p.path or "/").geturl()
+
+
+def _require_https(url):
+    """Abort unless url is https (plain http only for loopback hosts, e.g. tests)."""
+    p = urllib.parse.urlsplit(url)
+    if p.scheme != "https" and not (p.scheme == "http" and p.hostname in ("127.0.0.1", "localhost", "::1")):
+        _die(f"Error: login failed: refusing non-HTTPS OAuth URL {_clean(url)!r}.")
+
+
+def _flock(path, wait):
+    """Open path and flock it exclusively within `wait` seconds; None on timeout."""
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    f = open(path, "a")
+    deadline = time.time() + wait
+    while fcntl:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() >= deadline:
+                f.close()
+                return None
+            time.sleep(0.05)
+    return f
+
+
+def _tokens_lock():
+    """Lock the token store for a read-modify-write; use as `with _tokens_lock():`."""
+    f = _flock(TOKENS_PATH + ".lock", 10)
+    if not f:
+        _die(f"Error: timed out waiting for {TOKENS_PATH}.lock")
+    return f
+
+
+def _tokens_read():
+    """Load tokens.json; if unreadable/corrupt, warn once and act as logged out."""
+    global _tokens_warned
+    if not os.path.exists(TOKENS_PATH):
+        return {}
+    try:
+        with open(TOKENS_PATH) as f:
+            store = json.load(f)
+        if isinstance(store, dict) and all(isinstance(v, dict) for v in store.values()):
+            return store
+    except (OSError, ValueError):
+        pass
+    if not _tokens_warned:
+        _tokens_warned = True
+        print(f"Warning: ignoring unreadable {TOKENS_PATH}", file=sys.stderr)
+    return {}
+
+
+def _tokens_write(store):
+    """Atomically replace tokens.json (0600); call while holding _tokens_lock()."""
+    fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".tokens-")
+    os.chmod(tmp, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(store, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, TOKENS_PATH)
+
+
+def _tokens_put(name, entry):
+    """Set (or with entry=None delete) one server's entry under the lock; return the old one."""
+    with _tokens_lock():
+        store = _tokens_read()
+        old = store.pop(name, None)
+        if entry is not None:
+            store[name] = entry
+        if old is not None or entry is not None:
+            _tokens_write(store)
+        return old
+
+
+def _oauth_http(url, data=None, content_type="application/x-www-form-urlencoded"):
+    """GET (or POST data to) an OAuth endpoint; return (status, JSON object or {})."""
+    headers = {"User-Agent": "mcp-cli/1.0", "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = content_type
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=OAUTH_HTTP_TIMEOUT) as resp:
+            status, body = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read()
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        doc = {}
+    return status, doc if isinstance(doc, dict) else {}
+
+
+def _oauth_meta(urls):
+    """Return the first metadata document that answers 200, else {}."""
+    for u in urls:
+        _require_https(u)
+        status, doc = _oauth_http(u)
+        if status == 200 and doc:
+            return doc
+    return {}
+
+
+def oauth_header(name, url, failed_token=None):
+    """Return {"Authorization": "Bearer …"} for a logged-in server (refreshing if needed), else {}."""
+    def usable(e):
+        # tokens are bound to the URL they were issued for (a changed URL never gets them)
+        return bool(e and e.get("access_token")) and _norm_url(e.get("url", "")) == _norm_url(url)
+
+    def fresh(e):
+        # after a 401 any token other than the rejected one is new; otherwise trust expires_at
+        return e["access_token"] != failed_token if failed_token else time.time() < e.get("expires_at", 0) - 60
+
+    entry = _tokens_read().get(name)
+    if not usable(entry):
+        return {}
+    if fresh(entry):
+        return {"Authorization": f"Bearer {entry['access_token']}"}
+    with _tokens_lock():
+        store = _tokens_read()  # re-read: another mcp-call may have refreshed while we waited
+        entry = store.get(name)
+        if not usable(entry):
+            return {}
+        if fresh(entry):
+            return {"Authorization": f"Bearer {entry['access_token']}"}
+        if not entry.get("refresh_token"):
+            return {}
+        form = {"grant_type": "refresh_token", "refresh_token": entry["refresh_token"],
+                "client_id": entry["client_id"], "resource": entry["resource"]}
+        try:
+            status, tok = _oauth_http(entry["token_endpoint"], urllib.parse.urlencode(form).encode())
+        except OSError as e:  # URLError, TimeoutError, connection reset: keep tokens
+            _die(f"Error: token refresh for {name} failed ({_clean(getattr(e, 'reason', e))}).")
+        if tok.get("error") == "invalid_grant":
+            # refresh token expired/revoked: drop tokens, keep client_id for the next --login
+            entry.pop("access_token", None)
+            entry.pop("refresh_token", None)
+            _tokens_write(store)
+            return {}
+        if status != 200 or not tok.get("access_token"):
+            _die(f"Error: token refresh for {name} failed (HTTP {status} {_clean(tok.get('error', ''))}".rstrip() + ").")
+        entry["access_token"] = tok["access_token"]
+        entry["refresh_token"] = tok.get("refresh_token") or entry["refresh_token"]  # RFC 6749 §6: may be omitted
+        entry["expires_at"] = int(time.time()) + int(tok.get("expires_in") or 3600)
+        _tokens_write(store)  # persist at once: refresh tokens may be single-use
+        return {"Authorization": f"Bearer {entry['access_token']}"}
+
+
+def oauth_logout(name):
+    """Forget a server's stored OAuth entry locally (no server revocation); True if one existed."""
+    return name in _tokens_read() and _tokens_put(name, None) is not None
+
+
+def oauth_login(name, url):
+    """Interactive browser login: discover, register client (DCR), PKCE authorize, store tokens."""
+    # fail fast instead of racing a second login; held until this function returns
+    lock = _flock(os.path.join(CONFIG_DIR, "login-" + re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".lock"), 0)
+    if not lock:
+        _die(f"Error: login already in progress for '{name}'.")
+    # 1. discover: an unauthenticated initialize's 401 points at the protected-resource metadata
+    www_auth = ""
+    init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "mcp-cli", "version": "1.0"}}}).encode()
+    try:
+        HttpSession(url)._send(init, {"Content-Type": "application/json", "User-Agent": "mcp-cli/1.0",
+                                      "Accept": "application/json, text/event-stream"}, timeout=OAUTH_HTTP_TIMEOUT).close()
+    except urllib.error.HTTPError as e:
+        www_auth = e.headers.get("WWW-Authenticate", "") if e.headers else ""
+    m = re.search(r'resource_metadata="([^"]+)"', www_auth)
+    p = urllib.parse.urlsplit(url)
+    well_known = f"{p.scheme}://{p.netloc}/.well-known/oauth-protected-resource"  # RFC 9728, no trailing slash
+    prm = _oauth_meta([m.group(1)] if m else list(dict.fromkeys([well_known + p.path.rstrip("/"), well_known])))
+    if not prm:
+        _die(f"Error: login failed: {name} doesn't advertise OAuth (no protected-resource metadata).")
+    resource = prm.get("resource", "")
+    if _norm_url(resource) != _norm_url(url):  # RFC 9728 §3.3: metadata for another resource could phish tokens
+        _die(f"Error: login failed: metadata is for resource {_clean(resource)!r}, not {url}.")
+    issuer = (prm.get("authorization_servers") or [""])[0]
+    _require_https(issuer)
+    ip = urllib.parse.urlsplit(issuer)
+    meta = _oauth_meta([f"{ip.scheme}://{ip.netloc}/.well-known/{doc}{ip.path.rstrip('/')}"
+                        for doc in ("oauth-authorization-server", "openid-configuration")])
+    if meta.get("issuer") != issuer:  # RFC 8414 §3.3: exact match
+        _die(f"Error: login failed: authorization server metadata doesn't match issuer {_clean(issuer)!r}.")
+    if "S256" not in meta.get("code_challenge_methods_supported", []) or not meta.get("registration_endpoint"):
+        _die("Error: server doesn't support dynamic client registration; use --header with a static token.")
+    for key in ("authorization_endpoint", "token_endpoint", "registration_endpoint"):
+        _require_https(meta.get(key, ""))
+    m = re.search(r'(?:^|[\s,])scope="([^"]*)"', www_auth)
+    scope = m.group(1) if m else " ".join(prm.get("scopes_supported", []))
+
+    # 2. loopback callback server; the first valid callback wins
+    state, verifier = secrets.token_urlsafe(16), secrets.token_urlsafe(48)
+    outcome, done = [], threading.Event()
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        timeout = 10  # idle browser preconnects can't block the server
+
+        def log_message(self, *args):
+            pass  # the request line carries the auth code
+
+        def do_GET(self):
+            u = urllib.parse.urlsplit(self.path)
+            q = dict(urllib.parse.parse_qsl(u.query))
+            if u.path != "/callback":
+                return self._reply(404, "Not found.")
+            # a stray local request with the wrong state must not cancel the login
+            if not secrets.compare_digest(q.get("state", "").encode(), state.encode()):
+                return self._reply(400, "Invalid state.")
+            if q.get("error"):
+                outcome.append(("error", _clean(f"{q['error']} {q.get('error_description', '')}").strip()))
+            elif q.get("iss", issuer) != issuer:  # RFC 9207 mix-up defense
+                outcome.append(("error", "callback came from a different issuer"))
+            elif q.get("code"):
+                outcome.append(("code", q["code"]))
+            else:
+                return self._reply(400, "Missing code.")
+            done.set()
+            self._reply(200, "mcp-call login finished. You can close this tab and return to the terminal.")
+
+        def _reply(self, status, text):
+            body = f"<!doctype html><meta charset=utf-8><title>mcp-call</title><p>{text}</p>".encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(body)
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+    redirect_uri = f"http://127.0.0.1:{httpd.server_address[1]}/callback"  # host fixed, port may vary
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        # 3. client_id: reuse ours for this issuer, else register one (DCR)
+        entry = {"url": url, "resource": resource, "issuer": issuer, "scope": scope,
+                 "authorization_endpoint": meta["authorization_endpoint"], "token_endpoint": meta["token_endpoint"]}
+        old = _tokens_read().get(name) or {}
+        entry["client_id"] = old.get("client_id") if old.get("issuer") == issuer else None
+        if not entry["client_id"]:
+            reg = {"client_name": "mcp-call", "redirect_uris": [redirect_uri],
+                   "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"],
+                   "token_endpoint_auth_method": "none"}
+            if scope:
+                reg["scope"] = scope
+            status, doc = _oauth_http(meta["registration_endpoint"], json.dumps(reg).encode(), "application/json")
+            entry["client_id"] = doc.get("client_id") if 200 <= status < 300 else None
+            if not entry["client_id"]:
+                _die(f"Error: login failed: client registration returned HTTP {status}.")
+            _tokens_put(name, entry)  # persist now so a killed login leaves no orphan registration
+        # 4. PKCE authorize; the browser must open the URL itself (server sets a device cookie)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        params = {"response_type": "code", "client_id": entry["client_id"], "redirect_uri": redirect_uri,
+                  "code_challenge": challenge, "code_challenge_method": "S256", "state": state, "resource": resource}
+        if scope:
+            params["scope"] = scope
+        auth = meta["authorization_endpoint"]
+        auth_url = auth + ("&" if urllib.parse.urlsplit(auth).query else "?") + urllib.parse.urlencode(params)
+        print(f"Opening the browser to log in to {name}. If it doesn't open, visit:\n{auth_url}", file=sys.stderr)
+        # over SSH / headless Linux, webbrowser falls back to a blocking text browser
+        headless = sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        if not os.environ.get("SSH_CONNECTION") and not headless:
+            webbrowser.open(auth_url)
+        if not done.wait(LOGIN_TIMEOUT):
+            _die(f"Error: no callback received in {LOGIN_TIMEOUT}s. If the browser showed an error, run `mcp-call --logout {name}` and retry.")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    kind, value = outcome[0]
+    if kind == "error":
+        _die(f"Error: login failed: {value}")
+    # 5. exchange the code for tokens
+    form = {"grant_type": "authorization_code", "code": value, "redirect_uri": redirect_uri,
+            "client_id": entry["client_id"], "code_verifier": verifier, "resource": resource}
+    status, tok = _oauth_http(entry["token_endpoint"], urllib.parse.urlencode(form).encode())
+    if status != 200 or not tok.get("access_token") or str(tok.get("token_type", "")).lower() != "bearer":
+        _die(f"Error: login failed: token exchange returned HTTP {status} {_clean(tok.get('error', ''))}".rstrip() + ".")
+    entry.update(access_token=tok["access_token"], refresh_token=tok.get("refresh_token"),
+                 expires_at=int(time.time()) + int(tok.get("expires_in") or 3600))
+    _tokens_put(name, entry)
+    print(f"Logged in to {name}.")
 
 
 # --- Stdio transport ---
@@ -529,7 +892,7 @@ def fetch_tools(config, server_name=""):
     """Fetch tools list from server (HTTP or stdio), caching for completion."""
     tools = []
     if is_http(config):
-        session = HttpSession(config["url"], config.get("headers"))
+        session = HttpSession(config["url"], config.get("headers"), server_name)
         http_init(session)
         cursor, msg_id = None, 2
         while True:
@@ -749,6 +1112,8 @@ def add_server(raw_args):
 def add_http_server(name, url, headers=None):
     """Add a new HTTP MCP server."""
     servers = read_config()
+    if name in servers:
+        oauth_logout(name)  # a re-added server must not inherit old tokens
     entry = {"type": "http", "url": url}
     if headers:
         entry["headers"] = headers
@@ -765,6 +1130,7 @@ def remove_server(name):
         sys.exit(1)
     del servers[name]
     _save_config(servers)
+    oauth_logout(name)
     print(f"Removed server '{name}'")
 
 
@@ -867,6 +1233,8 @@ def _completion_candidates(prior, partial):
     # only those, not random server/tool names.
     if prior == ["--remove"] or prior == ["--clear-cache"]:
         return list(_load_json(CONFIG_PATH).keys())
+    if prior in (["--login"], ["--logout"]):
+        return [n for n, cfg in _load_json(CONFIG_PATH).items() if is_http(cfg)]
     if prior == ["--completion"]:
         return ["bash", "zsh", "fish"]
     # --add / --add-http take free-form command/URL/headers — nothing useful to suggest.
@@ -942,7 +1310,7 @@ def run_server(config, tool_name, tool_args, server_name=""):
         return
     # tool calls
     if is_http(config):
-        http_call_tool(config["url"], tool_name, tool_args, config.get("headers"))
+        http_call_tool(config["url"], tool_name, tool_args, config.get("headers"), server_name)
     else:
         proc = spawn_server(config)
         try:
@@ -977,6 +1345,27 @@ def main():
         return
     if server_name == "__remove__":
         remove_server(tool_name)
+        return
+    if server_name == "__login__":
+        cfg = servers.get(tool_name, {})
+        if not is_http(cfg):
+            print(f"Error: '{tool_name}' is not a configured HTTP server.", file=sys.stderr)
+            sys.exit(1)
+        if any(k.lower() == "authorization" for k in cfg.get("headers") or {}):
+            # the static header would always win over OAuth tokens
+            print(f"Error: '{tool_name}' has a static Authorization header; re-add it without one to use --login.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            oauth_login(tool_name, _expand_env(cfg["url"]))
+        except KeyboardInterrupt:
+            print("\nLogin cancelled.", file=sys.stderr)
+            sys.exit(130)
+        except OSError as e:  # network errors during discovery/registration/exchange
+            print(f"Error: login failed: {_clean(getattr(e, 'reason', e))}", file=sys.stderr)
+            sys.exit(1)
+        return
+    if server_name == "__logout__":
+        print(f"Logged out of {tool_name}." if oauth_logout(tool_name) else f"Not logged in to {tool_name}.")
         return
     if server_name == "__sync__":
         sync_from_claude()

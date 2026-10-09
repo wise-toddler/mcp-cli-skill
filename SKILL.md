@@ -23,6 +23,8 @@ echo '{}' | mcp-call <server> <tool>                  # call with stdin JSON
 mcp-call --add <name> <cmd> [args] [--env K=V ...]    # add stdio server
 mcp-call --add-http <name> <url> [--header 'K: V' ...] # add HTTP server (auth via --header/-H)
 mcp-call --remove <name>                              # remove server
+mcp-call --login <name>                               # OAuth browser login (the user runs this, not you)
+mcp-call --logout <name>                              # forget stored OAuth tokens
 mcp-call --sync                                       # re-sync from Claude configs
 mcp-call --completion <bash|zsh|fish>                 # print shell completion hook
 mcp-call --refresh-completions                        # cache tool lists for tab completion
@@ -39,6 +41,8 @@ mcp-call --add github npx @modelcontextprotocol/server-github --env GITHUB_TOKEN
 mcp-call --remove myredash
 mcp-call --sync
 ```
+
+If a call exits 4 with "needs interactive browser login", ask the user to run the `mcp-call --login <name>` command it prints; don't run it yourself.
 
 ## Examples
 
