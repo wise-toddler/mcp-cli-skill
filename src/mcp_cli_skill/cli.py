@@ -35,6 +35,7 @@ TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")  # OAuth tokens, mode 0600
 LOGIN_TIMEOUT = int(os.environ.get("MCP_CALL_LOGIN_TIMEOUT") or 300)  # seconds --login waits for the browser
 OAUTH_HTTP_TIMEOUT = 30  # every OAuth request gets an explicit timeout
 EXIT_NEEDS_LOGIN = 4  # exit code when the user must run --login
+PROTOCOL_VERSION = "2025-11-25"  # MCP spec version we offer; the server answers with the one it speaks
 
 # CLI flags that don't take a positional server/tool — used for completion.
 META_FLAGS = (
@@ -384,6 +385,7 @@ class HttpSession:
         self.url = _expand_env(url)
         self.config_url = self.url  # pre-redirect URL; credentials stay on its origin
         self.session_id = None
+        self.protocol_version = None  # negotiated at initialize; sent as MCP-Protocol-Version afterwards
         self.extra_headers = {k: _expand_env(v) for k, v in (extra_headers or {}).items()}
         self.server_name = server_name
         # a static Authorization header always wins over stored OAuth tokens
@@ -439,6 +441,8 @@ class HttpSession:
         headers.update(self.extra_headers)
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
+        if self.protocol_version:
+            headers["MCP-Protocol-Version"] = self.protocol_version
         try:
             with self._send(data, headers) as resp:
                 # capture session ID from response
@@ -490,6 +494,8 @@ class HttpSession:
         headers.update(self.extra_headers)
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
+        if self.protocol_version:
+            headers["MCP-Protocol-Version"] = self.protocol_version
         try:
             self._send(data, headers, timeout=10)
         except Exception:
@@ -706,7 +712,7 @@ def oauth_login(name, url, open_browser=True):
     # 1. discover: an unauthenticated initialize's 401 points at the protected-resource metadata
     www_auth = ""
     init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-        "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "mcp-cli", "version": "1.0"}}}).encode()
+        "protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "mcp-cli", "version": "1.0"}}}).encode()
     try:
         HttpSession(url)._send(init, {"Content-Type": "application/json", "User-Agent": "mcp-cli/1.0",
                                       "Accept": "application/json, text/event-stream"}, timeout=OAUTH_HTTP_TIMEOUT).close()
@@ -923,14 +929,16 @@ def _open_session(config, server_name=""):
             check_alive(session.proc)
         try:
             resp = session.rpc("initialize", {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {"name": "mcp-cli", "version": "1.0"}
             }, msg_id=1)
-            # HTTP ignores the init response; a silent stdio server is dead or not speaking MCP
+            # a silent stdio server is dead or not speaking MCP
             if stdio and not resp:
                 check_alive(session.proc)
                 raise McpError("Error: no response from server during init")
+            if not stdio and resp:
+                session.protocol_version = (resp.get("result") or {}).get("protocolVersion")
             session.notify("notifications/initialized")
         except BrokenPipeError:
             if not stdio:
