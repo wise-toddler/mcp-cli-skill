@@ -23,7 +23,7 @@ echo '{}' | mcp-call <server> <tool>                  # call with stdin JSON
 mcp-call --add <name> <cmd> [args] [--env K=V ...]    # add stdio server
 mcp-call --add-http <name> <url> [--header 'K: V' ...] # add HTTP server (auth via --header/-H)
 mcp-call --remove <name>                              # remove server
-mcp-call --login <name>                               # OAuth browser login (the user runs this, not you)
+mcp-call --login <name> [--no-browser]                # OAuth browser login (the user runs this, not you)
 mcp-call --logout <name>                              # forget stored OAuth tokens
 mcp-call --sync                                       # re-sync from Claude configs
 mcp-call --completion <bash|zsh|fish>                 # print shell completion hook

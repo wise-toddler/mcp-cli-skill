@@ -189,7 +189,7 @@ def parse_args():
         print("       mcp-call --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
         print("       mcp-call --add-http <name> <url>", file=sys.stderr)
         print("       mcp-call --remove <name>", file=sys.stderr)
-        print("       mcp-call --login <name>             (OAuth browser login for an HTTP server)", file=sys.stderr)
+        print("       mcp-call --login <name> [--no-browser]  (OAuth browser login; --no-browser only prints the URL)", file=sys.stderr)
         print("       mcp-call --logout <name>            (forget stored OAuth tokens)", file=sys.stderr)
         print("       mcp-call --sync", file=sys.stderr)
         print("       mcp-call --completion <bash|zsh|fish>", file=sys.stderr)
@@ -231,7 +231,7 @@ def parse_args():
         if len(args) < 2:
             print(f"Usage: mcp-call {args[0]} <name>", file=sys.stderr)
             sys.exit(1)
-        return f"__{args[0][2:]}__", args[1], {}
+        return f"__{args[0][2:]}__", args[1], {"no_browser": "--no-browser" in args[2:]}
     if args[0] == "--sync":
         return "__sync__", None, {}
     if args[0] == "--completion":
@@ -245,7 +245,7 @@ def parse_args():
     server = args[0]
     # `mcp-call <server> --login|--logout` alias the top-level flags
     if len(args) > 1 and args[1] in ("--login", "--logout"):
-        return f"__{args[1][2:]}__", server, {}
+        return f"__{args[1][2:]}__", server, {"no_browser": "--no-browser" in args[2:]}
     if len(args) < 2 or args[1] == "--tools":
         return server, "__tools__", {}
     if args[1] == "--discover":
@@ -669,7 +669,7 @@ def oauth_logout(name):
     return name in _tokens_read() and _tokens_put(name, None) is not None
 
 
-def oauth_login(name, url):
+def oauth_login(name, url, open_browser=True):
     """Interactive browser login: discover, register client (DCR), PKCE authorize, store tokens."""
     # fail fast instead of racing a second login; held until this function returns
     lock = _flock(os.path.join(CONFIG_DIR, "login-" + re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".lock"), 0)
@@ -773,10 +773,14 @@ def oauth_login(name, url):
             params["scope"] = scope
         auth = meta["authorization_endpoint"]
         auth_url = auth + ("&" if urllib.parse.urlsplit(auth).query else "?") + urllib.parse.urlencode(params)
-        print(f"Opening the browser to log in to {name}. If it doesn't open, visit:\n{auth_url}", file=sys.stderr)
+        if open_browser:
+            print(f"Opening the browser to log in to {name}. If it doesn't open, visit:\n{auth_url}", file=sys.stderr)
+        else:
+            # pick the account: open it in whichever browser profile is signed in to it
+            print(f"Open this URL in the browser profile you want to log in to {name} with:\n{auth_url}", file=sys.stderr)
         # over SSH / headless Linux, webbrowser falls back to a blocking text browser
         headless = sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-        if not os.environ.get("SSH_CONNECTION") and not headless:
+        if open_browser and not os.environ.get("SSH_CONNECTION") and not headless:
             webbrowser.open(auth_url)
         if not done.wait(LOGIN_TIMEOUT):
             _die(f"Error: no callback received in {LOGIN_TIMEOUT}s. If the browser showed an error, run `mcp-call --logout {name}` and retry.")
@@ -1356,7 +1360,7 @@ def main():
             print(f"Error: '{tool_name}' has a static Authorization header; re-add it without one to use --login.", file=sys.stderr)
             sys.exit(1)
         try:
-            oauth_login(tool_name, _expand_env(cfg["url"]))
+            oauth_login(tool_name, _expand_env(cfg["url"]), open_browser=not tool_args.get("no_browser"))
         except KeyboardInterrupt:
             print("\nLogin cancelled.", file=sys.stderr)
             sys.exit(130)

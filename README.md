@@ -49,6 +49,13 @@ mcp-call emergent --tools     # bearer token is sent and refreshed automatically
 mcp-call --logout emergent    # forget the local tokens (no server-side revocation)
 ```
 
+Multiple accounts on one server: add it under one name per account, and log in with `--no-browser`, which only prints the URL so you can open it in the browser profile signed in to that account (the default browser may silently approve as whoever is already signed in):
+
+```bash
+mcp-call --add-http emergent-work https://mcp.emergent.sh/
+mcp-call --login emergent-work --no-browser
+```
+
 Tokens live in `~/.mcp-cli/tokens.json` (mode 0600), bound to the server's URL. A call to a server that needs login exits with code 4 and says which `--login` to run. `--login` waits up to `MCP_CALL_LOGIN_TIMEOUT` seconds (default 300) for the browser; over SSH it prints the URL instead of opening a browser. A static `Authorization` header (`--header`) always wins over OAuth.
 
 ## Shell completion

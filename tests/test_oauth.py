@@ -201,9 +201,9 @@ class OAuthTest(unittest.TestCase):
         threading.Thread(target=go, daemon=True).start()
         return True
 
-    def run_cli(self, *args):
+    def run_cli(self, *args, err=None):
         """Run mcp-call in-process; return (exit code, stdout, stderr)."""
-        out, err, code = io.StringIO(), io.StringIO(), 0
+        out, err, code = io.StringIO(), err or io.StringIO(), 0
         with mock.patch.object(sys, "argv", ["mcp-call", *args]), mock.patch.object(sys, "stdin", io.StringIO("")), \
                 redirect_stdout(out), redirect_stderr(err):
             try:
@@ -362,6 +362,25 @@ class OAuthTest(unittest.TestCase):
         self.assertIn("metadata is for resource", err)
         self.assertEqual(self.fake.registers, 0)
         self.assertFalse(os.path.exists(cli.TOKENS_PATH))
+
+    def test_14_no_browser_prints_url_only(self):
+        opened = []
+        self.browser = opened.append  # webbrowser.open must not be called
+        test = self
+
+        class User(io.StringIO):
+            """Fake user: opens the printed authorize URL in 'another browser profile'."""
+            def write(self, text):
+                for word in text.split():
+                    if "/authorize?" in word:
+                        test.open_in_thread(word)
+                return super().write(text)
+
+        code, out, err = self.run_cli("fake", "--login", "--no-browser", err=User())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(opened, [])
+        self.assertIn("browser profile", err)
+        self.assertIn("Logged in to fake.", out)
 
 
 if __name__ == "__main__":
