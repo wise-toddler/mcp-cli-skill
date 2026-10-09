@@ -5,13 +5,15 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 FAKE_SERVER = textwrap.dedent("""
-    import json, os, sys
-    tools = os.environ.get("FAKE_TOOLS", "echo,slack_channel").split(",")
+    import base64, json, os, sys
+    tools = os.environ.get("FAKE_TOOLS", "echo,slack_channel,shot").split(",")
+    IMG = b"\\x89PNG fake image bytes"
     for line in sys.stdin:
         msg = json.loads(line)
         if msg.get("id") is None:
@@ -25,6 +27,14 @@ FAKE_SERVER = textwrap.dedent("""
             with open(os.environ["FAKE_LOG"], "a") as f:
                 f.write(msg["params"]["name"] + "\\n")
             res = {"content": [{"type": "text", "text": "ok " + msg["params"]["name"]}]}
+            if msg["params"]["name"] == "shot":  # like browser_screenshot: image block (+ saved file if path given)
+                img = {"type": "image", "data": base64.b64encode(IMG).decode(), "mimeType": "image/png"}
+                path = msg["params"].get("arguments", {}).get("path")
+                res = {"content": [img]}
+                if path:
+                    with open(path, "wb") as f:
+                        f.write(IMG)
+                    res["content"].append({"type": "text", "text": f"Saved {path} (1 KB)"})
         sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}) + "\\n")
         sys.stdout.flush()
 """)
@@ -43,7 +53,7 @@ class ArgsTest(unittest.TestCase):
 
     def run_cli(self, *args, tools=None):
         """Run mcp-call in a subprocess with an isolated HOME; return (exit code, stdout, stderr)."""
-        env = {**os.environ, "HOME": self.home, "PYTHONPATH": os.path.join(REPO, "src"), "NO_COLOR": "1"}
+        env = {**os.environ, "HOME": self.home, "TMPDIR": self.home, "PYTHONPATH": os.path.join(REPO, "src"), "NO_COLOR": "1"}
         if tools:
             env["FAKE_TOOLS"] = tools
         p = subprocess.run([sys.executable, "-m", "mcp_cli_skill.cli", *args], env=env, cwd=REPO,
@@ -90,6 +100,30 @@ class ArgsTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("ok brand_new", out)
         self.assertEqual(self.calls(), ["echo", "brand_new"])
+
+    def copies(self):
+        d = os.path.join(self.home, "mcp-call")
+        return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+    def test_image_already_saved_by_server_is_not_copied(self):
+        path = os.path.join(self.home, "shot.png")
+        code, out, err = self.run_cli("fake", "shot", f"--path={path}")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines()[0], path)  # image block points at the server's file
+        self.assertEqual(self.copies(), [])
+
+    def test_image_without_saved_file_is_copied_and_old_copies_pruned(self):
+        os.makedirs(os.path.join(self.home, "mcp-call"))
+        stale, fresh = (os.path.join(self.home, "mcp-call", n) for n in ("mcp-stale.png", "mcp-fresh.png"))
+        for p in (stale, fresh):
+            open(p, "w").close()
+        os.utime(stale, (time.time() - 2 * 86400,) * 2)
+        code, out, err = self.run_cli("fake", "shot")
+        self.assertEqual(code, 0, err)
+        copy = out.strip()
+        with open(copy, "rb") as f:
+            self.assertEqual(f.read(), b"\x89PNG fake image bytes")
+        self.assertEqual(self.copies(), sorted(["mcp-fresh.png", os.path.basename(copy)]))
 
     def test_schema_unknown_tool_suggests(self):
         code, _, err = self.run_cli("fake", "ech", "--schema")

@@ -296,6 +296,40 @@ def parse_args():
     return server, tool, tool_args
 
 
+def _named_file_with(items, data):
+    """Path named in a text block whose file holds exactly these bytes, else None."""
+    for it in items:
+        text = it.get("text", "") if it.get("type") == "text" else ""
+        for p in re.findall(r"[~/][^\s\"'`,;()<>\[\]{}]+", text):
+            p = os.path.expanduser(p.rstrip(".:"))
+            try:
+                if os.path.getsize(p) == len(data):
+                    with open(p, "rb") as f:
+                        if f.read() == data:
+                            return p
+            except OSError:
+                continue
+    return None
+
+
+def _save_image_copy(item, data):
+    """Write an image block to MCP_CALL_TMPDIR, pruning copies older than 24h; return its path."""
+    os.makedirs(MCP_CALL_TMPDIR, exist_ok=True)
+    cutoff = time.time() - 86400
+    for name in os.listdir(MCP_CALL_TMPDIR):
+        old = os.path.join(MCP_CALL_TMPDIR, name)
+        try:
+            if name.startswith("mcp-") and os.path.getmtime(old) < cutoff:
+                os.remove(old)
+        except OSError:
+            pass
+    ext = item.get("mimeType", "image/png").split("/")[-1]
+    fd, path = tempfile.mkstemp(suffix=f".{ext}", prefix="mcp-", dir=MCP_CALL_TMPDIR)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path
+
+
 def _print_content(items):
     """Print MCP content blocks (text, image, etc.)."""
     for item in items:
@@ -305,12 +339,9 @@ def _print_content(items):
             except json.JSONDecodeError:
                 print(item["text"])
         elif item.get("type") == "image":
-            os.makedirs(MCP_CALL_TMPDIR, exist_ok=True)
-            ext = item.get("mimeType", "image/png").split("/")[-1]
-            fd, path = tempfile.mkstemp(suffix=f".{ext}", prefix="mcp-", dir=MCP_CALL_TMPDIR)
-            os.write(fd, base64.b64decode(item["data"]))
-            os.close(fd)
-            print(path)
+            data = base64.b64decode(item["data"])
+            # the server may already have saved this exact image (e.g. a --path arg): point at it, don't copy
+            print(_named_file_with(items, data) or _save_image_copy(item, data))
         elif item.get("type") == "resource_link":
             line = item.get("uri", "")
             if item.get("name"):
