@@ -18,6 +18,7 @@ npx skills add wise-toddler/mcp-cli-skill -g
 ## Usage
 
 ```bash
+mcp-call --search ticket status                 # find tools across all servers (local cache, no network)
 mcp-call --servers                              # list configured servers
 mcp-call <server> --tools                       # discover tools (human-readable)
 mcp-call <server> --discover                    # discover tools as JSON with schemas

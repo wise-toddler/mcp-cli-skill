@@ -13,6 +13,7 @@ Always use `mcp-call` as the command, never `uvx mcp-cli-skill`.
 ## Commands
 
 ```bash
+mcp-call --search <words>                             # find tools across ALL servers (start here)
 mcp-call --servers                                    # list configured servers
 mcp-call <server> --tools                             # list tools (human-readable; --list / --help work too)
 mcp-call <server> --discover                          # list tools as JSON with schemas
@@ -41,6 +42,8 @@ mcp-call --add github npx @modelcontextprotocol/server-github --env GITHUB_TOKEN
 mcp-call --remove myredash
 mcp-call --sync
 ```
+
+Don't know which server has the tool you need? Run `mcp-call --search <words>` first: it searches every server's tool names and descriptions from a local cache in one call (name matches listed first, exit 1 if nothing matches), so you don't have to run `--tools` on each server.
 
 An unknown option or tool name exits 2 with a "Did you mean" hint and is never sent to the server — use the hint instead of guessing another name.
 

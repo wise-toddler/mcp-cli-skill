@@ -41,7 +41,7 @@ PROTOCOL_VERSION = "2025-11-25"  # MCP spec version we offer; the server answers
 META_FLAGS = (
     "--servers", "--sync", "--add", "--add-http", "--remove",
     "--login", "--logout",
-    "--completion", "--refresh-completions", "--clear-cache",
+    "--completion", "--refresh-completions", "--clear-cache", "--search",
     "--version", "--help",
 )
 # Flags valid after a server name (no tool yet).
@@ -207,6 +207,7 @@ def parse_args():
         print("       mcp-call --completion <bash|zsh|fish>", file=sys.stderr)
         print("       mcp-call --refresh-completions      (cache tool lists for tab completion)", file=sys.stderr)
         print("       mcp-call --clear-cache [server]", file=sys.stderr)
+        print("       mcp-call --search <word> [word ...]  (find tools across all servers, from the local cache)", file=sys.stderr)
         sys.exit(0 if args else 1)
 
     if args[0] == "--servers":
@@ -253,6 +254,11 @@ def parse_args():
         return "__refresh_completions__", None, {}
     if args[0] == "--clear-cache":
         return "__clear_cache__", args[1] if len(args) > 1 else None, {}
+    if args[0] == "--search":
+        if len(args) < 2:
+            print("Usage: mcp-call --search <word> [word ...]", file=sys.stderr)
+            sys.exit(1)
+        return "__search__", None, {"terms": args[1:]}
 
     server = args[0]
     # `mcp-call <server> --login|--logout` alias the top-level flags
@@ -997,6 +1003,35 @@ def _colors():
     }
 
 
+def search_tools(servers, terms):
+    """Print cached tools matching every term (name matches first); exit 1 if none match."""
+    c = _colors()
+    terms = " ".join(terms).lower().split()  # `--search "a b"` and `--search a b` mean the same
+    hits, uncached = [], []
+    for server in servers:
+        tools = _cache_read(server)
+        if not tools:
+            uncached.append(server)
+        for t in tools:
+            name, desc = t.get("name", ""), (t.get("description") or "").strip()
+            if all(w in f"{name} {desc}".lower() for w in terms):
+                # 0 = every word in the tool name, 1 = some only in the description
+                hits.append((0 if all(w in name.lower() for w in terms) else 1, server, name, desc.split("\n")[0]))
+    hits.sort()
+    width = shutil.get_terminal_size((100, 24)).columns
+    sw = max((len(h[1]) for h in hits), default=0)
+    nw = max((len(h[2]) for h in hits), default=0)
+    for _, server, name, desc in hits:
+        line_desc = _truncate(desc, max(20, width - sw - nw - 6))
+        print(f"  {c['cyan']}{server:<{sw}}{c['reset']}  {c['bold']}{name:<{nw}}{c['reset']}  {c['dim']}{line_desc}{c['reset']}")
+    if uncached:
+        shown = ", ".join(uncached[:5]) + (f" +{len(uncached) - 5} more" if len(uncached) > 5 else "")
+        print(f"{c['dim']}Not searched (no cached tool list): {shown}. Run: mcp-call --refresh-completions{c['reset']}", file=sys.stderr)
+    if not hits:
+        print(f"No cached tools match '{' '.join(terms)}'.", file=sys.stderr)
+        sys.exit(1)
+
+
 def _print_tools(tools):
     """Print tools in human-readable format with colors on a TTY."""
     c = _colors()
@@ -1303,7 +1338,7 @@ def _completion_candidates(prior, partial):
     if prior == ["--completion"]:
         return ["bash", "zsh", "fish"]
     # --add / --add-http take free-form command/URL/headers — nothing useful to suggest.
-    if prior and prior[0] in ("--add", "--add-http"):
+    if prior and prior[0] in ("--add", "--add-http", "--search"):
         return []
 
     positional = [a for a in prior if not a.startswith("-")]
@@ -1442,6 +1477,9 @@ def _main():
     if server_name == "__clear_cache__":
         _cache_clear(tool_name)
         print(f"Cleared cache{' for ' + tool_name if tool_name else ''}.")
+        return
+    if server_name == "__search__":
+        search_tools(servers, tool_args["terms"])
         return
 
     if server_name not in servers:

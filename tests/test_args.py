@@ -22,7 +22,9 @@ FAKE_SERVER = textwrap.dedent("""
         if method == "initialize":
             res = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "fake", "version": "1"}}
         elif method == "tools/list":
-            res = {"tools": [{"name": n, "inputSchema": {"type": "object", "properties": {}}} for n in tools]}
+            descs = {"shot": "Return an image, like echo but binary", "echo": "Echo text back; handy for slack tests"}
+            res = {"tools": [{"name": n, "description": descs.get(n, ""), "inputSchema": {"type": "object", "properties": {}}}
+                             for n in tools]}
         else:  # tools/call: log every name that actually reached the server
             with open(os.environ["FAKE_LOG"], "a") as f:
                 f.write(msg["params"]["name"] + "\\n")
@@ -49,7 +51,8 @@ class ArgsTest(unittest.TestCase):
             f.write(FAKE_SERVER)
         os.makedirs(os.path.join(self.home, ".mcp-cli"))
         with open(os.path.join(self.home, ".mcp-cli", "servers.json"), "w") as f:
-            json.dump({"fake": {"command": sys.executable, "args": [script], "env": {"FAKE_LOG": self.log}}}, f)
+            json.dump({"fake": {"command": sys.executable, "args": [script], "env": {"FAKE_LOG": self.log}},
+                       "uncached": {"command": sys.executable, "args": [script]}}, f)
 
     def run_cli(self, *args, tools=None):
         """Run mcp-call in a subprocess with an isolated HOME; return (exit code, stdout, stderr)."""
@@ -124,6 +127,25 @@ class ArgsTest(unittest.TestCase):
         with open(copy, "rb") as f:
             self.assertEqual(f.read(), b"\x89PNG fake image bytes")
         self.assertEqual(self.copies(), sorted(["mcp-fresh.png", os.path.basename(copy)]))
+
+    def test_search_ranks_name_matches_first_and_needs_every_word(self):
+        self.assertEqual(self.run_cli("fake", "--tools")[0], 0)  # fills the cache for "fake" only
+        code, out, err = self.run_cli("--search", "SLACK")  # case-insensitive
+        self.assertEqual(code, 0, err)
+        rows = [line.split()[1] for line in out.splitlines()]
+        # name match first even though "echo" (description-only match) sorts earlier alphabetically
+        self.assertEqual(rows, ["slack_channel", "echo"])
+        self.assertIn("Not searched (no cached tool list): uncached", err)
+        for args in (("echo", "binary"), ("echo binary",)):  # separate words or one quoted phrase
+            code, out, _ = self.run_cli("--search", *args)
+            self.assertEqual([line.split()[1] for line in out.splitlines()], ["shot"], args)
+        self.assertEqual(self.calls(), [])  # search never contacts a server
+
+    def test_search_no_match_exits_1(self):
+        self.assertEqual(self.run_cli("fake", "--tools")[0], 0)
+        code, out, err = self.run_cli("--search", "nonexistentword")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("No cached tools match 'nonexistentword'.", err)
 
     def test_schema_unknown_tool_suggests(self):
         code, _, err = self.run_cli("fake", "ech", "--schema")
