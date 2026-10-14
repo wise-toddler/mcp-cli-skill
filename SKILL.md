@@ -44,7 +44,7 @@ mcp-call --remove myredash
 mcp-call --sync
 ```
 
-Don't know which server has the tool you need? Run `mcp-call --search <words>` first: it searches every server's tool names and descriptions from a local cache in one call (name matches listed first, exit 1 if nothing matches), so you don't have to run `--tools` on each server. Each hit shows its params (`*` = required), so you can usually call the tool right away without `--help`. Read the default table; use `-o name` to compose (`mcp-call $(mcp-call --search "ticket status" -o name | head -1) --ticket_id=… --status=CLOSED`) and `-o json` for jq.
+Don't know which server has the tool you need? Run `mcp-call --search <words>` first: it searches every server's tool names and descriptions from a local cache in one call (name matches listed first, exit 1 if nothing matches), so you don't have to run `--tools` on each server. Each hit shows its params (`*` = required), so you can usually call the tool right away without `--help`. Read the default table and pick the server yourself: when the same tool is on several servers (e.g. `emergent-work` and `emergent-personal` are different accounts), never just take the first hit. `-o json` is there for jq.
 
 An unknown option or tool name exits 2 with a "Did you mean" hint and is never sent to the server — use the hint instead of guessing another name.
 
