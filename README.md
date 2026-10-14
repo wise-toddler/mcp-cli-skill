@@ -21,7 +21,9 @@ npx skills add wise-toddler/mcp-cli-skill -g
 mcp-call --search ticket status                 # find tools across all servers (local cache, no network)
 mcp-call --servers                              # list configured servers
 mcp-call <server> --tools                       # discover tools (human-readable)
-mcp-call <server> --discover                    # discover tools as JSON with schemas
+mcp-call <server> --discover                    # discover tools as JSON with schemas (= --tools -o json)
+# --servers, --tools and --search take -o table|json|name (kubectl-style); name = `server` / `server tool`:
+mcp-call $(mcp-call --search "ticket status" -o name | head -1) --ticket_id=42 --status=CLOSED
 mcp-call <server> <tool> --schema               # show tool's input schema as JSON
 mcp-call <server> <tool> --key=value ...        # call a tool
 mcp-call <server> <tool> --input-json '{"k":"v"}' # call with JSON args

@@ -1,2 +1,2 @@
 """MCP CLI - Call any MCP server tool from the command line."""
-__version__ = "0.10.0"
+__version__ = "0.11.0"

@@ -13,10 +13,11 @@ Always use `mcp-call` as the command, never `uvx mcp-cli-skill`.
 ## Commands
 
 ```bash
-mcp-call --search <words>                             # find tools across ALL servers (start here)
+mcp-call --search <words>                             # find tools across ALL servers, with params (start here)
 mcp-call --servers                                    # list configured servers
 mcp-call <server> --tools                             # list tools (human-readable; --list / --help work too)
-mcp-call <server> --discover                          # list tools as JSON with schemas
+mcp-call <server> --discover                          # list tools as JSON with schemas (= --tools -o json)
+# --servers / --tools / --search all take -o table|json|name; name prints `server` or `server tool`
 mcp-call <server> <tool> --schema                     # show tool's input schema as JSON
 mcp-call <server> <tool> --key=value ...              # call a tool
 mcp-call <server> <tool> --input-json '{"key":"val"}'  # call with JSON args
@@ -43,7 +44,7 @@ mcp-call --remove myredash
 mcp-call --sync
 ```
 
-Don't know which server has the tool you need? Run `mcp-call --search <words>` first: it searches every server's tool names and descriptions from a local cache in one call (name matches listed first, exit 1 if nothing matches), so you don't have to run `--tools` on each server.
+Don't know which server has the tool you need? Run `mcp-call --search <words>` first: it searches every server's tool names and descriptions from a local cache in one call (name matches listed first, exit 1 if nothing matches), so you don't have to run `--tools` on each server. Each hit shows its params (`*` = required), so you can usually call the tool right away without `--help`. Read the default table; use `-o name` to compose (`mcp-call $(mcp-call --search "ticket status" -o name | head -1) --ticket_id=… --status=CLOSED`) and `-o json` for jq.
 
 An unknown option or tool name exits 2 with a "Did you mean" hint and is never sent to the server — use the hint instead of guessing another name.
 

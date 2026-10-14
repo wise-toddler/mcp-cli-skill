@@ -23,8 +23,9 @@ FAKE_SERVER = textwrap.dedent("""
             res = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "fake", "version": "1"}}
         elif method == "tools/list":
             descs = {"shot": "Return an image, like echo but binary", "echo": "Echo text back; handy for slack tests"}
-            res = {"tools": [{"name": n, "description": descs.get(n, ""), "inputSchema": {"type": "object", "properties": {}}}
-                             for n in tools]}
+            schemas = {"echo": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}
+            res = {"tools": [{"name": n, "description": descs.get(n, ""),
+                              "inputSchema": schemas.get(n, {"type": "object", "properties": {}})} for n in tools]}
         else:  # tools/call: log every name that actually reached the server
             with open(os.environ["FAKE_LOG"], "a") as f:
                 f.write(msg["params"]["name"] + "\\n")
@@ -62,6 +63,11 @@ class ArgsTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-m", "mcp_cli_skill.cli", *args], env=env, cwd=REPO,
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
         return p.returncode, p.stdout, p.stderr
+
+    @staticmethod
+    def rows(out):
+        """Tool names from --search table output (skipping the indented --param lines)."""
+        return [ln.split()[1] for ln in out.splitlines() if ln.split() and not ln.split()[0].startswith("--")]
 
     def calls(self):
         if not os.path.exists(self.log):
@@ -132,13 +138,13 @@ class ArgsTest(unittest.TestCase):
         self.assertEqual(self.run_cli("fake", "--tools")[0], 0)  # fills the cache for "fake" only
         code, out, err = self.run_cli("--search", "SLACK")  # case-insensitive
         self.assertEqual(code, 0, err)
-        rows = [line.split()[1] for line in out.splitlines()]
+        rows = self.rows(out)
         # name match first even though "echo" (description-only match) sorts earlier alphabetically
         self.assertEqual(rows, ["slack_channel", "echo"])
         self.assertIn("Not searched (no cached tool list): uncached", err)
         for args in (("echo", "binary"), ("echo binary",)):  # separate words or one quoted phrase
             code, out, _ = self.run_cli("--search", *args)
-            self.assertEqual([line.split()[1] for line in out.splitlines()], ["shot"], args)
+            self.assertEqual(self.rows(out), ["shot"], args)
         self.assertEqual(self.calls(), [])  # search never contacts a server
 
     def test_search_no_match_exits_1(self):
@@ -146,6 +152,51 @@ class ArgsTest(unittest.TestCase):
         code, out, err = self.run_cli("--search", "nonexistentword")
         self.assertEqual((code, out), (1, ""))
         self.assertIn("No cached tools match 'nonexistentword'.", err)
+
+    def test_output_formats_tools(self):
+        code, out, err = self.run_cli("fake", "--tools", "-o", "name")
+        self.assertEqual((code, out.splitlines()), (0, ["fake echo", "fake slack_channel", "fake shot"]), err)
+        discover = self.run_cli("fake", "--discover")[1]
+        for args in (("fake", "--tools", "-o", "json"), ("fake", "-o=json"), ("fake", "--output", "json")):
+            self.assertEqual(self.run_cli(*args)[1], discover, args)  # -o json is exactly --discover
+        self.assertEqual(json.loads(discover)[0]["inputSchema"]["required"], ["text"])
+        self.assertTrue(discover.startswith('[\n  {\n    "name": "echo"'), discover[:40])  # --discover's indented format since v0.3
+
+    def test_output_formats_servers(self):
+        code, out, err = self.run_cli("--servers", "-o", "name")
+        self.assertEqual((code, out.splitlines()), (0, ["fake", "uncached"]), err)
+        out = self.run_cli("--servers", "-o", "json")[1]
+        self.assertEqual([(s["name"], s["transport"]) for s in json.loads(out)], [("fake", "stdio"), ("uncached", "stdio")])
+        self.assertNotIn("FAKE_LOG", out)  # env/headers can hold secrets: never printed
+
+    def test_output_formats_search(self):
+        self.assertEqual(self.run_cli("fake", "--tools")[0], 0)
+        out = self.run_cli("--search", "echo")[1]
+        self.assertIn("--text*", out)  # params shown so the agent can call without --help
+        self.assertEqual(self.run_cli("--search", "echo", "-o", "name")[1].splitlines(), ["fake echo", "fake shot"])
+        hits = json.loads(self.run_cli("--search", "-o", "json", "echo")[1])  # -o may come before the words
+        self.assertEqual([(h["tool"], h["required"], h["params"]) for h in hits],
+                         [("echo", ["text"], ["text"]), ("shot", [], [])])
+        code, out, _ = self.run_cli("--search", "nothinghere", "-o", "json")
+        self.assertEqual((code, json.loads(out)), (1, []))
+
+    def test_bad_output_format(self):
+        code, _, err = self.run_cli("--servers", "-o", "yaml")
+        self.assertEqual(code, 2)
+        self.assertIn("unknown output format 'yaml'. Use one of: table, json, name.", err)
+        code, _, err = self.run_cli("--search", "echo", "-o")
+        self.assertEqual(code, 2)
+        self.assertIn("-o needs a format", err)
+
+    def test_piped_servers_not_truncated(self):
+        url = "https://example.invalid/" + "x" * 200
+        path = os.path.join(self.home, ".mcp-cli", "servers.json")
+        with open(path) as f:
+            cfg = json.load(f)
+        cfg["long"] = {"type": "http", "url": url}
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        self.assertIn(url, self.run_cli("--servers")[1])  # not a TTY here, so no "…"
 
     def test_schema_unknown_tool_suggests(self):
         code, _, err = self.run_cli("fake", "ech", "--schema")

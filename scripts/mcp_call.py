@@ -36,6 +36,8 @@ LOGIN_TIMEOUT = int(os.environ.get("MCP_CALL_LOGIN_TIMEOUT") or 300)  # seconds 
 OAUTH_HTTP_TIMEOUT = 30  # every OAuth request gets an explicit timeout
 EXIT_NEEDS_LOGIN = 4  # exit code when the user must run --login
 PROTOCOL_VERSION = "2025-11-25"  # MCP spec version we offer; the server answers with the one it speaks
+# -o/--output for --servers, --tools, --search: name = what you'd type next (`server` or `server tool`)
+OUTPUT_FORMATS = ("table", "json", "name")
 
 # CLI flags that don't take a positional server/tool — used for completion.
 META_FLAGS = (
@@ -45,7 +47,7 @@ META_FLAGS = (
     "--version", "--help",
 )
 # Flags valid after a server name (no tool yet).
-SERVER_FLAGS = ("--tools", "--discover", "--help")
+SERVER_FLAGS = ("--tools", "--discover", "--help", "--output")
 # Flags valid after a server + tool.
 TOOL_FLAGS = ("--help", "--schema", "--input-json")
 
@@ -179,6 +181,28 @@ def parse_value(val):
         return val
 
 
+def _pop_output(args):
+    """Split `-o/--output FORMAT` out of args; return (format, remaining args). Exits 2 on a bad format."""
+    fmt, rest, i = "table", [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-o", "--output"):
+            if i + 1 >= len(args):
+                print(f"Error: {a} needs a format: {', '.join(OUTPUT_FORMATS)}.", file=sys.stderr)
+                sys.exit(2)
+            fmt, i = args[i + 1], i + 2
+            continue
+        if a.startswith(("-o=", "--output=")):
+            fmt = a.split("=", 1)[1]
+        else:
+            rest.append(a)
+        i += 1
+    if fmt not in OUTPUT_FORMATS:
+        print(f"Error: unknown output format '{fmt}'. Use one of: {', '.join(OUTPUT_FORMATS)}.", file=sys.stderr)
+        sys.exit(2)
+    return fmt, rest
+
+
 def parse_args():
     """Parse CLI arguments into server, tool, and args dict."""
     args = sys.argv[1:]
@@ -193,8 +217,8 @@ def parse_args():
         sys.exit(0)
     if not args or args[0] in ("-h", "--help"):
         print("Usage: mcp-call <server> <tool> [--key=value ...] [--input-json '{...}'] [-- <tool params verbatim>]", file=sys.stderr)
-        print("       mcp-call --servers", file=sys.stderr)
-        print("       mcp-call <server> --tools", file=sys.stderr)
+        print("       mcp-call --servers [-o table|json|name]", file=sys.stderr)
+        print("       mcp-call <server> --tools [-o table|json|name]", file=sys.stderr)
         print("       mcp-call <server> --discover", file=sys.stderr)
         print("       mcp-call <server> <tool> --help     (formatted help)", file=sys.stderr)
         print("       mcp-call <server> <tool> --schema   (raw JSON schema)", file=sys.stderr)
@@ -207,11 +231,11 @@ def parse_args():
         print("       mcp-call --completion <bash|zsh|fish>", file=sys.stderr)
         print("       mcp-call --refresh-completions      (cache tool lists for tab completion)", file=sys.stderr)
         print("       mcp-call --clear-cache [server]", file=sys.stderr)
-        print("       mcp-call --search <word> [word ...]  (find tools across all servers, from the local cache)", file=sys.stderr)
+        print("       mcp-call --search <word> [word ...] [-o table|json|name]  (find tools across all servers, local cache)", file=sys.stderr)
         sys.exit(0 if args else 1)
 
     if args[0] == "--servers":
-        return "__servers__", None, {}
+        return "__servers__", None, {"output": _pop_output(args[1:])[0]}
     if args[0] == "--add":
         return "__add__", None, {"_raw": args[1:]}
     if args[0] == "--add-http":
@@ -255,18 +279,20 @@ def parse_args():
     if args[0] == "--clear-cache":
         return "__clear_cache__", args[1] if len(args) > 1 else None, {}
     if args[0] == "--search":
-        if len(args) < 2:
-            print("Usage: mcp-call --search <word> [word ...]", file=sys.stderr)
+        fmt, terms = _pop_output(args[1:])
+        if not terms:
+            print("Usage: mcp-call --search <word> [word ...] [-o table|json|name]", file=sys.stderr)
             sys.exit(1)
-        return "__search__", None, {"terms": args[1:]}
+        return "__search__", None, {"terms": terms, "output": fmt}
 
     server = args[0]
     # `mcp-call <server> --login|--logout` alias the top-level flags
     if len(args) > 1 and args[1] in ("--login", "--logout"):
         return f"__{args[1][2:]}__", server, {"no_browser": "--no-browser" in args[2:]}
-    # --list / --help / -h are what people (and agents) guess for "list tools"
-    if len(args) < 2 or args[1] in ("--tools", "--list", "--help", "-h"):
-        return server, "__tools__", {}
+    # --list / --help / -h are what people (and agents) guess for "list tools"; `<server> -o json` lists too
+    if len(args) < 2 or args[1] in ("--tools", "--list", "--help", "-h", "-o", "--output") \
+            or args[1].startswith(("-o=", "--output=")):
+        return server, "__tools__", {"output": _pop_output(args[1:])[0]}
     if args[1] == "--discover":
         return server, "__discover__", {}
     if args[1].startswith("-"):
@@ -1003,7 +1029,7 @@ def _colors():
     }
 
 
-def search_tools(servers, terms):
+def search_tools(servers, terms, fmt="table"):
     """Print cached tools matching every term (name matches first); exit 1 if none match."""
     c = _colors()
     terms = " ".join(terms).lower().split()  # `--search "a b"` and `--search a b` mean the same
@@ -1016,14 +1042,27 @@ def search_tools(servers, terms):
             name, desc = t.get("name", ""), (t.get("description") or "").strip()
             if all(w in f"{name} {desc}".lower() for w in terms):
                 # 0 = every word in the tool name, 1 = some only in the description
-                hits.append((0 if all(w in name.lower() for w in terms) else 1, server, name, desc.split("\n")[0]))
-    hits.sort()
-    width = shutil.get_terminal_size((100, 24)).columns
-    sw = max((len(h[1]) for h in hits), default=0)
-    nw = max((len(h[2]) for h in hits), default=0)
-    for _, server, name, desc in hits:
-        line_desc = _truncate(desc, max(20, width - sw - nw - 6))
-        print(f"  {c['cyan']}{server:<{sw}}{c['reset']}  {c['bold']}{name:<{nw}}{c['reset']}  {c['dim']}{line_desc}{c['reset']}")
+                rank = 0 if all(w in name.lower() for w in terms) else 1
+                hits.append((rank, server, name, desc.split("\n")[0], t.get("inputSchema") or {}))
+    hits.sort(key=lambda h: h[:4])
+    if fmt == "json":
+        print(json.dumps([{"server": s, "tool": n, "description": d,
+                           "required": list(sch.get("required") or []), "params": list(sch.get("properties") or {})}
+                          for _, s, n, d, sch in hits], indent=2))
+    elif fmt == "name":
+        for _, server, name, _, _ in hits:
+            print(f"{server} {name}")
+    else:
+        width = shutil.get_terminal_size((100, 24)).columns
+        sw = max((len(h[1]) for h in hits), default=0)
+        nw = max((len(h[2]) for h in hits), default=0)
+        for _, server, name, desc, schema in hits:
+            # truncate only for humans; agents/pipes get the whole line
+            line_desc = _truncate(desc, max(20, width - sw - nw - 6)) if sys.stdout.isatty() else desc
+            print(f"  {c['cyan']}{server:<{sw}}{c['reset']}  {c['bold']}{name:<{nw}}{c['reset']}  {c['dim']}{line_desc}{c['reset']}")
+            flags = _flag_list(schema, c)
+            if flags:
+                print(f"  {'':<{sw}}  {' '.join(flags)}")
     if uncached:
         shown = ", ".join(uncached[:5]) + (f" +{len(uncached) - 5} more" if len(uncached) > 5 else "")
         print(f"{c['dim']}Not searched (no cached tool list): {shown}. Run: mcp-call --refresh-completions{c['reset']}", file=sys.stderr)
@@ -1032,20 +1071,35 @@ def search_tools(servers, terms):
         sys.exit(1)
 
 
-def _print_tools(tools):
-    """Print tools in human-readable format with colors on a TTY."""
+def _flag_list(schema, c):
+    """A tool's params as `--name` flags, required first and marked `*`."""
+    schema = schema or {}
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    flags = []
+    for k in sorted(props, key=lambda x: x not in required):
+        mark = f"{c['yellow']}*{c['reset']}" if k in required else ""
+        col = c["yellow"] if k in required else c["dim"]
+        flags.append(f"{col}--{k}{c['reset']}{mark}")
+    return flags
+
+
+def _print_tools(tools, fmt="table", server_name=""):
+    """Print tools as a colored table, JSON (same as --discover), or `server tool` names."""
+    if fmt == "json":
+        out = [{"name": t["name"], "description": t.get("description", ""),
+                "inputSchema": t.get("inputSchema", {})} for t in tools]
+        print(json.dumps(out, indent=2))
+        return
+    if fmt == "name":
+        for tool in tools:
+            print(f"{server_name} {tool['name']}")
+        return
     c = _colors()
     print(f"{c['dim']}{len(tools)} tools  ({c['yellow']}*{c['dim']} = required){c['reset']}\n")
     for tool in tools:
-        schema = tool.get("inputSchema", {})
-        props = schema.get("properties", {})
-        required = set(schema.get("required", []))
         # required flags marked with *, sorted required-first
-        flags = []
-        for k in sorted(props, key=lambda x: x not in required):
-            mark = f"{c['yellow']}*{c['reset']}" if k in required else ""
-            col = c["yellow"] if k in required else c["dim"]
-            flags.append(f"{col}--{k}{c['reset']}{mark}")
+        flags = _flag_list(tool.get("inputSchema", {}), c)
         print(f"  {c['cyan']}{c['bold']}{tool['name']}{c['reset']}")
         # only the summary line — skip verbose "Args:" docstring section
         desc = (tool.get("description") or "").strip().split("\n")[0]
@@ -1121,9 +1175,31 @@ def _truncate(text, width):
     return text if len(text) <= width else text[: max(0, width - 1)] + "…"
 
 
-def list_servers(servers):
-    """Print configured servers grouped by transport, collapsing duplicate stdio servers."""
+def list_servers(servers, fmt="table"):
+    """Print configured servers: grouped table (duplicate stdio collapsed), JSON, or names."""
     c = _colors()
+    tokens = _tokens_read()  # local file only; no network
+
+    def login_state(name):
+        """'logged in' / 'login needed' for servers with an OAuth entry, else None."""
+        entry, cfg = tokens.get(name), servers[name]
+        if entry is None or not is_http(cfg):
+            return None
+        if entry.get("access_token") and _norm_url(entry.get("url", "")) == _norm_url(_expand_env(cfg["url"])):
+            return "logged in"
+        return "login needed"
+
+    if fmt == "name":
+        for name in sorted(servers):
+            print(name)
+        return
+    if fmt == "json":
+        # never headers/env: they can hold tokens
+        out = [{"name": n, "transport": "http", "url": cfg["url"], "login": login_state(n)} if is_http(cfg) else
+               {"name": n, "transport": "stdio", "command": [cfg.get("command", "?")] + cfg.get("args", [])}
+               for n, cfg in sorted(servers.items())]
+        print(json.dumps(out, indent=2))
+        return
     term_w = shutil.get_terminal_size((100, 24)).columns
     # split + group by config identity
     http_groups, stdio_groups = {}, {}
@@ -1131,16 +1207,13 @@ def list_servers(servers):
         bucket = http_groups if is_http(cfg) else stdio_groups
         bucket.setdefault(_config_key(name, cfg), []).append(name)
     max_name = min(max((len(n) for n in servers), default=20), 28)
-    tokens = _tokens_read()  # local file only; no network
 
     def login_mark(name):
         """'🔑 logged in' / '🔑 login needed' for servers with an OAuth entry, else ''."""
-        entry, cfg = tokens.get(name), servers[name]
-        if entry is None or not is_http(cfg):
+        state = login_state(name)
+        if state is None:
             return "", ""
-        if entry.get("access_token") and _norm_url(entry.get("url", "")) == _norm_url(_expand_env(cfg["url"])):
-            return "🔑 logged in", c["green"]
-        return "🔑 login needed", c["yellow"]
+        return f"🔑 {state}", c["green"] if state == "logged in" else c["yellow"]
 
     def print_group(label, color, groups, target_fn):
         total = sum(len(v) for v in groups.values())
@@ -1157,7 +1230,8 @@ def list_servers(servers):
             base = f"  ● {primary:<{max_name}}  "
             visible_len = len(base)
             avail = max(20, term_w - visible_len - 4 - (len(mark) + 2 if mark else 0))
-            target_disp = _truncate(target, avail)
+            # truncate only for humans; agents/pipes get the whole URL/command
+            target_disp = _truncate(target, avail) if sys.stdout.isatty() else target
             line = f"  {c['green']}●{c['reset']} {c['bold']}{primary:<{max_name}}{c['reset']}  {c['dim']}{target_disp}{c['reset']}"
             if mark:
                 line += f"  {mark_color}{mark}{c['reset']}"
@@ -1335,6 +1409,8 @@ def _completion_candidates(prior, partial):
         return list(_load_json(CONFIG_PATH).keys())
     if prior in (["--login"], ["--logout"]):
         return [n for n, cfg in _load_json(CONFIG_PATH).items() if is_http(cfg)]
+    if prior and prior[-1] in ("-o", "--output"):
+        return list(OUTPUT_FORMATS)
     if prior == ["--completion"]:
         return ["bash", "zsh", "fish"]
     # --add / --add-http take free-form command/URL/headers — nothing useful to suggest.
@@ -1393,11 +1469,9 @@ def run_server(config, tool_name, tool_args, server_name=""):
     if tool_name in ("__tools__", "__discover__", "__schema__", "__help__"):
         tools = fetch_tools(config, server_name)
         if tool_name == "__tools__":
-            _print_tools(tools)
-        elif tool_name == "__discover__":
-            out = [{"name": t["name"], "description": t.get("description", ""),
-                     "inputSchema": t.get("inputSchema", {})} for t in tools]
-            print(json.dumps(out, indent=2))
+            _print_tools(tools, tool_args.get("output", "table"), server_name)
+        elif tool_name == "__discover__":  # same as --tools -o json, kept for existing users
+            _print_tools(tools, "json", server_name)
         elif tool_name == "__schema__":
             target = tool_args["_tool"]
             for t in tools:
@@ -1433,7 +1507,7 @@ def _main():
     server_name, tool_name, tool_args = parse_args()
 
     if server_name == "__servers__":
-        list_servers(servers)
+        list_servers(servers, tool_args["output"])
         return
     if server_name == "__add__":
         add_server(tool_args["_raw"])
@@ -1479,7 +1553,7 @@ def _main():
         print(f"Cleared cache{' for ' + tool_name if tool_name else ''}.")
         return
     if server_name == "__search__":
-        search_tools(servers, tool_args["terms"])
+        search_tools(servers, tool_args["terms"], tool_args["output"])
         return
 
     if server_name not in servers:
