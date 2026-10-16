@@ -337,5 +337,25 @@ class GapsTest(unittest.TestCase):
         self.assertEqual(complete("fake", "echo", "--"), ["--help", "--schema", "--input-json"])  # unchanged (no cache)
 
 
+    # gap 12
+    def test_help_on_stdout(self):
+        for flag in ("--help", "-h"):
+            code, out, err = self.run_cli(flag)
+            self.assertEqual((code, err), (0, ""), flag)
+            self.assertTrue(out.startswith("Usage: mcp-call <server> <tool>"), out)
+            self.assertIn("mcp-call --add-http <name> <url> [-H|--header 'Key: Value' ...]", out)
+        code, out, err = self.run_cli()  # a bare call is still an error: usage on stderr, exit 1
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith("Usage: mcp-call <server> <tool>"), err)
+
+    def test_version(self):
+        with open(os.path.join(REPO, "src", "mcp_cli_skill", "__init__.py")) as f:
+            want = f.read().split('__version__ = "')[1].split('"')[0]
+        self.assertEqual(self.run_cli("--version"), (0, want + "\n", ""))
+        # the synced standalone copy has no __init__.py beside it
+        script = os.path.join(REPO, "scripts", "mcp_call.py")
+        self.assertEqual(self.run_cli("--version", cmd=[sys.executable, script]), (0, "unknown\n", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

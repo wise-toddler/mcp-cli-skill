@@ -37,6 +37,7 @@ Config stored at `~/.mcp-cli/servers.json`. On first run, auto-seeds from `~/.cl
 ```bash
 mcp-call --add myserver uvx some-mcp --env API_KEY=abc123
 mcp-call --add-http myapi http://localhost:8010/mcp
+mcp-call --add-http keyed https://api.example.com/mcp --header 'X-API-Key: ${MY_API_KEY}'  # or -H; ${VAR} expands at call time
 mcp-call --remove myserver
 mcp-call --sync    # re-sync from Claude configs
 ```

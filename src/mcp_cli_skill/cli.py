@@ -264,29 +264,33 @@ def parse_args(servers=()):
     if args and args[0] == "--version":
         # __version__ lives in __init__.py, pyproject.toml reads from there
         here = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(here, "__init__.py")) as f:
-            for line in f:
-                if line.startswith("__version__"):
-                    print(line.split("=")[1].strip().strip('"'))
-                    break
+        try:
+            with open(os.path.join(here, "__init__.py")) as f:
+                for line in f:
+                    if line.startswith("__version__"):
+                        print(line.split("=")[1].strip().strip('"'))
+                        break
+        except OSError:  # a standalone copy (scripts/mcp_call.py) has no __init__.py beside it
+            print("unknown")
         sys.exit(0)
     if not args or args[0] in ("-h", "--help"):
-        print("Usage: mcp-call <server> <tool> [--key=value ...] [--input-json '{...}'] [-- <tool params verbatim>]", file=sys.stderr)
-        print("       mcp-call --servers [-o table|json|name]", file=sys.stderr)
-        print("       mcp-call <server> --tools [-o table|json|name]", file=sys.stderr)
-        print("       mcp-call <server> --discover", file=sys.stderr)
-        print("       mcp-call <server> <tool> --help     (formatted help)", file=sys.stderr)
-        print("       mcp-call <server> <tool> --schema   (raw JSON schema)", file=sys.stderr)
-        print("       mcp-call --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
-        print("       mcp-call --add-http <name> <url>", file=sys.stderr)
-        print("       mcp-call --remove <name>", file=sys.stderr)
-        print("       mcp-call --login <name> [--no-browser]  (OAuth browser login; --no-browser only prints the URL)", file=sys.stderr)
-        print("       mcp-call --logout <name>            (forget stored OAuth tokens)", file=sys.stderr)
-        print("       mcp-call --sync", file=sys.stderr)
-        print("       mcp-call --completion <bash|zsh|fish>", file=sys.stderr)
-        print("       mcp-call --refresh-completions      (cache tool lists for tab completion)", file=sys.stderr)
-        print("       mcp-call --clear-cache [server]", file=sys.stderr)
-        print("       mcp-call --search <word> [word ...] [-o table|json|name]  (find tools across all servers, local cache)", file=sys.stderr)
+        out = sys.stdout if args else sys.stderr  # asked-for help is pipeable; a bare call is an error
+        print("Usage: mcp-call <server> <tool> [--key=value ...] [--input-json '{...}'] [-- <tool params verbatim>]", file=out)
+        print("       mcp-call --servers [-o table|json|name]", file=out)
+        print("       mcp-call <server> --tools [-o table|json|name]", file=out)
+        print("       mcp-call <server> --discover", file=out)
+        print("       mcp-call <server> <tool> --help     (formatted help)", file=out)
+        print("       mcp-call <server> <tool> --schema   (raw JSON schema)", file=out)
+        print("       mcp-call --add <name> <command> [args...] [--env KEY=VAL ...]", file=out)
+        print("       mcp-call --add-http <name> <url> [-H|--header 'Key: Value' ...]", file=out)
+        print("       mcp-call --remove <name>", file=out)
+        print("       mcp-call --login <name> [--no-browser]  (OAuth browser login; --no-browser only prints the URL)", file=out)
+        print("       mcp-call --logout <name>            (forget stored OAuth tokens)", file=out)
+        print("       mcp-call --sync", file=out)
+        print("       mcp-call --completion <bash|zsh|fish>", file=out)
+        print("       mcp-call --refresh-completions      (cache tool lists for tab completion)", file=out)
+        print("       mcp-call --clear-cache [server]", file=out)
+        print("       mcp-call --search <word> [word ...] [-o table|json|name]  (find tools across all servers, local cache)", file=out)
         sys.exit(0 if args else 1)
 
     if args[0] in ("--servers", "--list"):  # --list: what people guess for "list servers"

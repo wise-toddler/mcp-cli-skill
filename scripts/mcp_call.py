@@ -209,11 +209,14 @@ def parse_args():
     if args and args[0] == "--version":
         # __version__ lives in __init__.py, pyproject.toml reads from there
         here = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(here, "__init__.py")) as f:
-            for line in f:
-                if line.startswith("__version__"):
-                    print(line.split("=")[1].strip().strip('"'))
-                    break
+        try:
+            with open(os.path.join(here, "__init__.py")) as f:
+                for line in f:
+                    if line.startswith("__version__"):
+                        print(line.split("=")[1].strip().strip('"'))
+                        break
+        except OSError:  # a standalone copy (scripts/mcp_call.py) has no __init__.py beside it
+            print("unknown")
         sys.exit(0)
     if not args or args[0] in ("-h", "--help"):
         print("Usage: mcp-call <server> <tool> [--key=value ...] [--input-json '{...}'] [-- <tool params verbatim>]", file=sys.stderr)
