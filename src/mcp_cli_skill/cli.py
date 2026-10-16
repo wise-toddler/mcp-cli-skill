@@ -4,6 +4,7 @@ import base64
 import contextlib
 import difflib
 import hashlib
+import http.client
 import http.server
 import json
 import os
@@ -485,7 +486,12 @@ class HttpSession:
                 content_type = resp.headers.get("Content-Type", "")
                 if "text/event-stream" in content_type:
                     return _parse_sse(body, msg_id)
-                return json.loads(body)
+                try:
+                    return json.loads(body)
+                except ValueError:
+                    # like a stdio server's non-JSON output (v0.4.1): say what came back, no traceback
+                    snippet = _clean(" ".join(body.split())[:200]) or "empty body"
+                    raise McpError(f"Error: non-JSON response from {self.url} (HTTP {resp.status}): {snippet}")
         except urllib.error.HTTPError as e:
             body = e.read().decode() if e.fp else ""
             # OAuth 401: refresh + retry once; decide on "did we send a token", not the 401's error code
@@ -515,6 +521,9 @@ class HttpSession:
         except TimeoutError:
             # urlopen raises bare TimeoutError in Python 3.10+, not URLError.
             raise McpError(f"Error: request to {self.url} timed out. Set MCP_CALL_HTTP_TIMEOUT=<sec> for longer.")
+        except (ValueError, http.client.HTTPException, ConnectionError) as e:
+            # undecodable body, or the connection dropped mid-response
+            raise McpError(f"Error: bad response from {self.url}: {_clean(e) or type(e).__name__}")
 
     def notify(self, method, params=None):
         """Send JSON-RPC notification (no id, ignore response)."""
@@ -546,10 +555,10 @@ class HttpSession:
 def _parse_sse(body, expected_id):
     """Parse SSE response and extract JSON-RPC message matching expected_id."""
     for line in body.splitlines():
-        if line.startswith("data: "):
+        if line.startswith("data:"):  # the space after "data:" is optional
             try:
-                msg = json.loads(line[6:])
-                if msg.get("id") == expected_id:
+                msg = json.loads(line[5:])
+                if isinstance(msg, dict) and msg.get("id") == expected_id:
                     return msg
             except json.JSONDecodeError:
                 continue
@@ -891,6 +900,8 @@ def recv(proc, expected_id=None):
         try:
             resp = json.loads(line)
         except json.JSONDecodeError:
+            resp = None
+        if not isinstance(resp, dict):  # not JSON, or JSON that isn't an object (42, null, [])
             non_json.append(line.rstrip())
             continue
         if expected_id is None or resp.get("id") == expected_id:
@@ -924,8 +935,11 @@ def check_alive(proc):
 class StdioSession:
     """Stdio MCP server process behind the same rpc/notify interface as HttpSession."""
 
-    def __init__(self, config):
-        self.proc = spawn_server(config)
+    def __init__(self, config, server_name=""):
+        try:
+            self.proc = spawn_server(config)
+        except OSError as e:  # command missing or not executable
+            raise McpError(f"Error: cannot start server '{server_name}': {_expand_env(config['command'])}: {e.strerror or e}")
 
     def rpc(self, method, params=None, msg_id=1):
         """Send JSON-RPC request via stdio and return the matching response (None if none)."""
@@ -955,7 +969,7 @@ class StdioSession:
 def _open_session(config, server_name=""):
     """Yield an HTTP or stdio session after the initialize handshake; closes it on exit."""
     stdio = not is_http(config)
-    session = StdioSession(config) if stdio else HttpSession(config["url"], config.get("headers"), server_name)
+    session = StdioSession(config, server_name) if stdio else HttpSession(config["url"], config.get("headers"), server_name)
     with session:
         if stdio:
             check_alive(session.proc)
@@ -993,14 +1007,16 @@ def call_tool(config, tool_name, tool_args, server_name=""):
 
 # --- Tool discovery ---
 
-def fetch_tools(config, server_name=""):
-    """Fetch tools list from server (HTTP or stdio), caching for completion."""
+def fetch_tools(config, server_name="", strict=True):
+    """Fetch tools list from server (HTTP or stdio), caching for completion; strict raises on a JSON-RPC error."""
     tools = []
     with _open_session(config, server_name) as session:
         cursor, msg_id = None, 2
         while True:
             params = {"cursor": cursor} if cursor else {}
             resp = session.rpc("tools/list", params, msg_id=msg_id)
+            if strict and resp and "error" in resp:
+                raise McpError(f"Error: tools/list failed: {json.dumps(resp['error'])}")
             if not resp or "result" not in resp:
                 break
             tools += resp["result"].get("tools", [])
@@ -1490,8 +1506,8 @@ def run_server(config, tool_name, tool_args, server_name=""):
     # tool calls: a name missing from the cached list is a typo or a newly added tool,
     # so re-fetch once (refreshes the cache) and only refuse if the server lacks it too
     if server_name and tool_name not in [t.get("name") for t in _cache_read(server_name)]:
-        names = [t.get("name") for t in fetch_tools(config, server_name)]
-        if names and tool_name not in names:  # empty list = server can't list tools; let the call decide
+        names = [t.get("name") for t in fetch_tools(config, server_name, strict=False)]
+        if names and tool_name not in names:  # empty list = server can't (or won't) list tools; let the call decide
             _unknown_tool(server_name, tool_name, names)
     call_tool(config, tool_name, tool_args, server_name)
 
