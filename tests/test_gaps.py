@@ -287,5 +287,55 @@ class GapsTest(unittest.TestCase):
             self.assertEqual(self.run_cli(*argv)[0], 0, argv)
 
 
+    # gap 6
+    def test_servers_keeps_env_distinct_stdio_apart(self):
+        stdio = lambda token: {"command": "uvx", "args": ["slack-mcp"], "env": {"TOKEN": token}}  # noqa: E731
+        self.servers = {"slack-a": stdio("secret-a"), "slack-b": stdio("secret-b"), "slack-c": stdio("secret-a")}
+        self.write_servers()
+        code, out, err = self.run_cli("--servers")
+        self.assertEqual(code, 0, err)
+        self.assertIn("STDIO (3) (2 unique, 3 total)", out)
+        self.assertIn("aliases: slack-c", out)  # identical config (env too) still collapses
+        self.assertNotIn("aliases: slack-b", out)
+        self.assertIn("● slack-b", out)
+        self.assertNotIn("secret", out)  # env is never printed
+
+    # gap 11
+    def test_piped_servers_full_alias_list(self):
+        self.servers = {f"dup{i}": {"command": "same", "args": ["x"]} for i in range(8)}
+        self.write_servers()
+        out = self.run_cli("--servers")[1]
+        self.assertIn("aliases: dup1, dup2, dup3, dup4, dup5, dup6, dup7\n", out)
+        self.assertNotIn("more", out)
+
+    def test_clear_cache_unknown(self):
+        self.assertEqual(self.run_cli("--clear-cache", "nosuch"), (1, "", "No cache for 'nosuch'.\n"))
+        # a configured server with no cache yet, and a leftover cache of a removed server, still clear fine
+        self.assertEqual(self.run_cli("--clear-cache", "fake"), (0, "Cleared cache for fake.\n", ""))
+        os.makedirs(os.path.join(self.home, ".mcp-cli", "cache"))
+        gone = os.path.join(self.home, ".mcp-cli", "cache", "tools-gone.json")
+        with open(gone, "w") as f:
+            json.dump({"ts": 1, "tools": []}, f)
+        self.assertEqual(self.run_cli("--clear-cache", "gone"), (0, "Cleared cache for gone.\n", ""))
+        self.assertFalse(os.path.exists(gone))
+
+    # gap 10
+    def test_completion(self):
+        def complete(*words):
+            return self.run_cli(*words, env={"_MCP_CALL_COMPLETE": "1"})[1].split()
+        http = sorted(n for n, c in self.servers.items() if "url" in c)
+        self.assertEqual(complete("--servers", ""), ["-o", "--output"])
+        self.assertEqual(complete("--list", ""), ["-o", "--output"])
+        self.assertEqual(complete("fake", "--tools", ""), ["-o", "--output"])
+        self.assertEqual(complete("--servers", "-o", ""), ["table", "json", "name"])
+        self.assertEqual(complete("--login", "html200", ""), ["--no-browser"])
+        self.assertEqual(complete("html200", "--login", ""), ["--no-browser"])
+        self.assertEqual(complete("--login", "html200", "--no-browser", ""), [])
+        self.assertEqual(sorted(complete("--login", "--no-browser", "")), http)
+        self.assertEqual(sorted(complete("--login", "")), http)  # unchanged
+        self.assertEqual(complete("fake", "--l"), ["--login", "--logout"])
+        self.assertEqual(complete("fake", "echo", "--"), ["--help", "--schema", "--input-json"])  # unchanged (no cache)
+
+
 if __name__ == "__main__":
     unittest.main()

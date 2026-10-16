@@ -63,7 +63,7 @@ META_FLAGS = (
     "--version", "--help",
 )
 # Flags valid after a server name (no tool yet).
-SERVER_FLAGS = ("--tools", "--discover", "--help", "--output")
+SERVER_FLAGS = ("--tools", "--discover", "--help", "--output", "--login", "--logout")
 # Flags valid after a server + tool.
 TOOL_FLAGS = ("--help", "--schema", "--input-json")
 
@@ -1270,7 +1270,8 @@ def _config_key(name, cfg):
     if is_http(cfg):
         # same URL under another name is a different account or key, never an alias
         return ("http", cfg["url"], name)
-    return ("stdio", cfg.get("command", "?"), tuple(cfg.get("args", [])))
+    # same command with another env (token, account) is another server too; env is never printed
+    return ("stdio", cfg.get("command", "?"), tuple(cfg.get("args", [])), json.dumps(cfg.get("env") or {}, sort_keys=True))
 
 
 def _truncate(text, width):
@@ -1343,8 +1344,9 @@ def list_servers(servers, fmt="table"):
             print(line)
             # show extra aliases under primary, indented
             if len(names_sorted) > 1:
-                aliases = ", ".join(names_sorted[1:6])
-                more = f" +{len(names_sorted) - 6} more" if len(names_sorted) > 6 else ""
+                cut = 6 if sys.stdout.isatty() else len(names_sorted)  # shorten only for humans; pipes get every alias
+                aliases = ", ".join(names_sorted[1:cut])
+                more = f" +{len(names_sorted) - cut} more" if len(names_sorted) > cut else ""
                 print(f"    {c['dim']}aliases: {aliases}{more}{c['reset']}")
 
     if http_groups:
@@ -1513,10 +1515,18 @@ def _completion_candidates(prior, partial):
     # only those, not random server/tool names.
     if prior == ["--remove"] or prior == ["--clear-cache"]:
         return list(_load_json(CONFIG_PATH).keys())
-    if prior in (["--login"], ["--logout"]):
+    login = [a for a in prior if a != "--no-browser"]
+    if login in (["--login"], ["--logout"]):
         return [n for n, cfg in _load_json(CONFIG_PATH).items() if is_http(cfg)]
+    # after `--login <name>` (or `<name> --login`) only --no-browser is left to type
+    if len(login) == 2 and ("--login" in login or "--logout" in login):
+        return ["--no-browser"] if "--login" in login and "--no-browser" not in prior else []
     if prior and prior[-1] in ("-o", "--output"):
         return list(OUTPUT_FORMATS)
+    # --servers and <server> --tools take only -o/--output
+    if prior and prior[0] in ("--servers", "--list") or \
+            len(prior) > 1 and prior[1] in ("--tools", "--list") and not prior[0].startswith("-"):
+        return ["-o", "--output"]
     if prior == ["--completion"]:
         return ["bash", "zsh", "fish"]
     # --add / --add-http take free-form command/URL/headers — nothing useful to suggest.
@@ -1655,6 +1665,9 @@ def _main():
         refresh_completions()
         return
     if server_name == "__clear_cache__":
+        if tool_name and tool_name not in servers and not os.path.exists(_cache_path(tool_name)):
+            print(f"No cache for '{tool_name}'.", file=sys.stderr)
+            sys.exit(1)
         _cache_clear(tool_name)
         print(f"Cleared cache{' for ' + tool_name if tool_name else ''}.")
         return
