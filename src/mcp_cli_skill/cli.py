@@ -29,11 +29,10 @@ except ImportError:  # Windows: the token store runs without a lock
 _env_warned = set()  # env vars already warned about: one warning per run, not per request
 
 
-def _env_int(name, default):
-    """Integer env var; a non-integer warns once on stderr and falls back to default."""
-    raw = os.environ.get(name)
+def _env_int(name, raw, default):
+    """int(raw) read from env var `name`; a non-integer warns once on stderr and falls back to default."""
     try:
-        return int(raw) if raw else default
+        return int(raw)
     except ValueError:
         if name not in _env_warned:
             _env_warned.add(name)
@@ -48,7 +47,7 @@ CACHE_DIR = os.path.join(CONFIG_DIR, "cache")
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")  # OAuth tokens, mode 0600
-LOGIN_TIMEOUT = _env_int("MCP_CALL_LOGIN_TIMEOUT", 300)  # seconds --login waits for the browser
+LOGIN_TIMEOUT = _env_int("MCP_CALL_LOGIN_TIMEOUT", os.environ.get("MCP_CALL_LOGIN_TIMEOUT") or 300, 300)  # seconds --login waits for the browser
 OAUTH_HTTP_TIMEOUT = 30  # every OAuth request gets an explicit timeout
 EXIT_NEEDS_LOGIN = 4  # exit code when the user must run --login
 PROTOCOL_VERSION = "2025-11-25"  # MCP spec version we offer; the server answers with the one it speaks
@@ -527,7 +526,7 @@ class HttpSession:
         """
         # Long-running tool calls (bash, LLM, etc) can exceed 30s; make it tunable.
         if timeout is None:
-            timeout = _env_int("MCP_CALL_HTTP_TIMEOUT", 300)
+            timeout = _env_int("MCP_CALL_HTTP_TIMEOUT", os.environ.get("MCP_CALL_HTTP_TIMEOUT", "300"), 300)
         url = self.url
         for _ in range(max_redirects + 1):
             if _origin(url) != _origin(self.config_url):

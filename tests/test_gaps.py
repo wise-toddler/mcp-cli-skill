@@ -253,6 +253,15 @@ class GapsTest(unittest.TestCase):
             code, out, err = self.run_cli(server, "--tools", "-o", "name", env={name: "abc"})
             self.assertEqual((code, out), (0, f"{server} echo\n"), err)
             self.assertEqual(err, f"Warning: ignoring {name}='abc' (not an integer); using 300.\n")
+        # the timeouts actually used: defaults stay 300s, valid values are honored
+        code = ("import urllib.request\nfrom mcp_cli_skill import cli\nseen = []\n"
+                "def urlopen(req, timeout=None):\n    seen.append(timeout)\n    raise TimeoutError\n"
+                "urllib.request.urlopen = urlopen\n"
+                "try:\n    cli.HttpSession('http://127.0.0.1:9/mcp').rpc('tools/list')\nexcept cli.McpError:\n    pass\n"
+                "print(seen, cli.LOGIN_TIMEOUT)")
+        for value, want in ((None, "[300] 300"), ("", "[300] 300"), ("abc", "[300] 300"), ("7", "[7] 7")):
+            env = {} if value is None else {"MCP_CALL_HTTP_TIMEOUT": value, "MCP_CALL_LOGIN_TIMEOUT": value}
+            self.assertEqual(self.run_cli(env=env, cmd=[sys.executable, "-c", code])[1].strip(), want, value)
 
     # gap 8
     def test_leftover_args_exit_2(self):
