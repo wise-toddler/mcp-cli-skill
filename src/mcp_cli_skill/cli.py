@@ -26,6 +26,21 @@ try:
 except ImportError:  # Windows: the token store runs without a lock
     fcntl = None
 
+_env_warned = set()  # env vars already warned about: one warning per run, not per request
+
+
+def _env_int(name, default):
+    """Integer env var; a non-integer warns once on stderr and falls back to default."""
+    raw = os.environ.get(name)
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        if name not in _env_warned:
+            _env_warned.add(name)
+            print(f"Warning: ignoring {name}={raw!r} (not an integer); using {default}.", file=sys.stderr)
+        return default
+
+
 MCP_CALL_TMPDIR = os.path.join(tempfile.gettempdir(), "mcp-call")
 CONFIG_DIR = os.path.expanduser("~/.mcp-cli")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "servers.json")
@@ -33,7 +48,7 @@ CACHE_DIR = os.path.join(CONFIG_DIR, "cache")
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")  # OAuth tokens, mode 0600
-LOGIN_TIMEOUT = int(os.environ.get("MCP_CALL_LOGIN_TIMEOUT") or 300)  # seconds --login waits for the browser
+LOGIN_TIMEOUT = _env_int("MCP_CALL_LOGIN_TIMEOUT", 300)  # seconds --login waits for the browser
 OAUTH_HTTP_TIMEOUT = 30  # every OAuth request gets an explicit timeout
 EXIT_NEEDS_LOGIN = 4  # exit code when the user must run --login
 PROTOCOL_VERSION = "2025-11-25"  # MCP spec version we offer; the server answers with the one it speaks
@@ -204,7 +219,46 @@ def _pop_output(args):
     return fmt, rest
 
 
-def parse_args():
+def _bad_arg(arg, where, flags=(), tail=""):
+    """Exit 2 on an argument that would otherwise be silently dropped or misread; hint the closest flag."""
+    close = difflib.get_close_matches(arg, flags, n=1) if arg.startswith("-") else []
+    hint = f" Did you mean {close[0]}?" if close else ""
+    print(f"Error: unexpected argument '{arg}' {where}.{hint}{tail}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _login_args(flag, rest):
+    """Parse --login/--logout operands: one server name, --no-browser in any position; exit 2 on anything else."""
+    names = [a for a in rest if a != "--no-browser"]
+    if not names:
+        print(f"Usage: mcp-call {flag} <name>", file=sys.stderr)
+        sys.exit(1)
+    extra = [a for a in names if a.startswith("-")] + names[1:]
+    if extra:  # e.g. a --no-brower typo must never fall through to opening the browser
+        usage = f" Usage: mcp-call {flag} <name>" + (" [--no-browser]" if flag == "--login" else "")
+        _bad_arg(extra[0], f"for {flag}", ("--no-browser",), usage)
+    return f"__{flag[2:]}__", names[0], {"no_browser": "--no-browser" in rest}
+
+
+def _put_header(headers, text):
+    """Add a 'Key: Value' header to headers; exit 2 if it has no colon."""
+    if ":" not in text:
+        print(f"Error: header '{text}' must look like 'Key: Value'.", file=sys.stderr)
+        sys.exit(2)
+    k, v = text.split(":", 1)
+    headers[k.strip()] = v.strip()
+
+
+def _input_json(tool_args, text):
+    """Merge --input-json's JSON object into tool_args; exit 2 with a clean error if it isn't one."""
+    try:
+        tool_args.update(json.loads(text))
+    except (ValueError, TypeError) as e:
+        print(f"Error: --input-json needs a JSON object: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def parse_args(servers=()):
     """Parse CLI arguments into server, tool, and args dict."""
     args = sys.argv[1:]
     if args and args[0] == "--version":
@@ -235,8 +289,11 @@ def parse_args():
         print("       mcp-call --search <word> [word ...] [-o table|json|name]  (find tools across all servers, local cache)", file=sys.stderr)
         sys.exit(0 if args else 1)
 
-    if args[0] == "--servers":
-        return "__servers__", None, {"output": _pop_output(args[1:])[0]}
+    if args[0] in ("--servers", "--list"):  # --list: what people guess for "list servers"
+        fmt, extra = _pop_output(args[1:])
+        if extra:
+            _bad_arg(extra[0], f"after {args[0]}", ("-o", "--output"))
+        return "__servers__", None, {"output": fmt}
     if args[0] == "--add":
         return "__add__", None, {"_raw": args[1:]}
     if args[0] == "--add-http":
@@ -248,13 +305,10 @@ def parse_args():
         while i < len(args):
             a = args[i]
             if a in ("-H", "--header") and i + 1 < len(args):
-                k, v = args[i + 1].split(":", 1)
-                add_args["headers"][k.strip()] = v.strip()
+                _put_header(add_args["headers"], args[i + 1])
                 i += 2
             elif a.startswith("--header=") or a.startswith("-H="):
-                _, v = a.split("=", 1)
-                k, v = v.split(":", 1)
-                add_args["headers"][k.strip()] = v.strip()
+                _put_header(add_args["headers"], a.split("=", 1)[1])
                 i += 1
             else:
                 print(f"Error: unknown flag {a!r} for --add-http. Use -H or --header 'Key: Value'.", file=sys.stderr)
@@ -265,12 +319,17 @@ def parse_args():
             print("Usage: mcp-call --remove <name>", file=sys.stderr)
             sys.exit(1)
         return "__remove__", args[1], {}
-    if args[0] in ("--login", "--logout"):
-        if len(args) < 2:
-            print(f"Usage: mcp-call {args[0]} <name>", file=sys.stderr)
-            sys.exit(1)
-        return f"__{args[0][2:]}__", args[1], {"no_browser": "--no-browser" in args[2:]}
+    # --login|--logout <name>, or the `<name> --login|--logout` alias; --no-browser may sit anywhere
+    pos = [a for a in args if a != "--no-browser"]
+    login = ("--login", "--logout")
+    if pos and pos[0] in login or len(pos) > 1 and pos[1] in login and not pos[0].startswith("-"):
+        flag = pos[0] if pos[0] in login else pos[1]
+        rest = list(args)
+        rest.remove(flag)
+        return _login_args(flag, rest)
     if args[0] == "--sync":
+        if len(args) > 1:
+            _bad_arg(args[1], "after --sync")
         return "__sync__", None, {}
     if args[0] == "--completion":
         shell = args[1] if len(args) > 1 else "bash"
@@ -281,19 +340,35 @@ def parse_args():
         return "__clear_cache__", args[1] if len(args) > 1 else None, {}
     if args[0] == "--search":
         fmt, terms = _pop_output(args[1:])
+        flags = [t for t in terms if t.startswith("-")]
+        if flags:
+            _bad_arg(flags[0], "after --search", ("-o", "--output"))
         if not terms:
             print("Usage: mcp-call --search <word> [word ...] [-o table|json|name]", file=sys.stderr)
             sys.exit(1)
         return "__search__", None, {"terms": terms, "output": fmt}
 
+    if args[0].startswith("-") and args[0] not in servers:
+        # never treat an option as a server name
+        flag = args[0]
+        if flag in ("--tools", "--discover", "-o", "--output") or flag.startswith(("-o=", "--output=")):
+            print(f"Error: {flag} needs a server: mcp-call <server> {' '.join(args)} — or search every server: mcp-call --search <words>", file=sys.stderr)
+            sys.exit(2)
+        close = difflib.get_close_matches(flag, META_FLAGS, n=1)
+        hint = f" Did you mean {close[0]}?" if close else ""
+        print(f"Error: unknown option '{flag}'.{hint} See: mcp-call --help", file=sys.stderr)
+        sys.exit(2)
+
     server = args[0]
-    # `mcp-call <server> --login|--logout` alias the top-level flags
-    if len(args) > 1 and args[1] in ("--login", "--logout"):
-        return f"__{args[1][2:]}__", server, {"no_browser": "--no-browser" in args[2:]}
     # --list / --help / -h are what people (and agents) guess for "list tools"; `<server> -o json` lists too
     if len(args) < 2 or args[1] in ("--tools", "--list", "--help", "-h", "-o", "--output") \
             or args[1].startswith(("-o=", "--output=")):
-        return server, "__tools__", {"output": _pop_output(args[1:])[0]}
+        fmt, extra = _pop_output(args[1:])
+        extra = [a for a in extra if a not in ("--tools", "--list", "--help", "-h")]
+        if extra:
+            tail = "" if extra[0].startswith("-") else f" For one tool: mcp-call {server} {extra[0]} --help"
+            _bad_arg(extra[0], f"for '{server} {args[1]}'", ("-o", "--output", "--tools"), tail)
+        return server, "__tools__", {"output": fmt}
     if args[1] == "--discover":
         return server, "__discover__", {}
     if args[1].startswith("-"):
@@ -305,6 +380,7 @@ def parse_args():
 
     tool = args[1]
     tool_args = {}
+    stray = []  # bare words / single-dash tokens: rejected after the loop, so a later --help/--schema still wins
     i = 2
     verbatim = False  # after a bare `--`, everything is tool params, never meta-flags
     while i < len(args):
@@ -315,12 +391,15 @@ def parse_args():
             return server, "__schema__", {"_tool": tool}
         elif not verbatim and arg in ("--help", "-h"):
             return server, "__help__", {"_tool": tool}
-        elif not verbatim and arg == "--input-json" and i + 1 < len(args):
-            tool_args.update(json.loads(args[i + 1]))
+        elif not verbatim and arg == "--input-json":
+            if i + 1 >= len(args):
+                print("Error: --input-json needs a JSON object: no value given.", file=sys.stderr)
+                sys.exit(2)
+            _input_json(tool_args, args[i + 1])
             i += 2
             continue
         elif not verbatim and arg.startswith("--input-json="):
-            tool_args.update(json.loads(arg[13:]))
+            _input_json(tool_args, arg[13:])
         elif arg.startswith("--") and "=" in arg:
             key, val = arg[2:].split("=", 1)
             tool_args[key] = parse_value(val)
@@ -331,12 +410,20 @@ def parse_args():
                 i += 2
                 continue
             tool_args[arg[2:]] = True
+        elif not verbatim:
+            stray.append(arg)
         i += 1
+    if stray:
+        _bad_arg(stray[0], f"for '{server} {tool}'", tail=" Tool params look like --key=value or --key value.")
     # read JSON from stdin if no args provided and stdin is piped
     if not tool_args and not sys.stdin.isatty():
         stdin_data = sys.stdin.read().strip()
         if stdin_data:
-            tool_args = json.loads(stdin_data)
+            try:
+                tool_args = json.loads(stdin_data)
+            except ValueError as e:
+                print(f"Error: stdin is not valid JSON: {e}", file=sys.stderr)
+                sys.exit(2)
     return server, tool, tool_args
 
 
@@ -436,7 +523,7 @@ class HttpSession:
         """
         # Long-running tool calls (bash, LLM, etc) can exceed 30s; make it tunable.
         if timeout is None:
-            timeout = int(os.environ.get("MCP_CALL_HTTP_TIMEOUT", "300"))
+            timeout = _env_int("MCP_CALL_HTTP_TIMEOUT", 300)
         url = self.url
         for _ in range(max_redirects + 1):
             if _origin(url) != _origin(self.config_url):
@@ -1280,6 +1367,9 @@ def add_server(raw_args):
     i = 2
     while i < len(raw_args):
         if raw_args[i] == "--env" and i + 1 < len(raw_args):
+            if "=" not in raw_args[i + 1]:
+                print(f"Error: --env needs KEY=VALUE, got '{raw_args[i + 1]}'.", file=sys.stderr)
+                sys.exit(2)
             k, v = raw_args[i + 1].split("=", 1)
             env[k] = v
             i += 2
@@ -1520,7 +1610,7 @@ def _main():
         return
 
     servers = read_config()
-    server_name, tool_name, tool_args = parse_args()
+    server_name, tool_name, tool_args = parse_args(servers)
 
     if server_name == "__servers__":
         list_servers(servers, tool_args["output"])
@@ -1573,9 +1663,12 @@ def _main():
         return
 
     if server_name not in servers:
-        print(f"Error: '{server_name}' not found. Available:", file=sys.stderr)
-        list_servers(servers)
-        sys.exit(1)
+        close = difflib.get_close_matches(server_name, list(servers), n=3)
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        print(f"Error: '{server_name}' not found.{hint} Available:", file=sys.stderr)
+        with contextlib.redirect_stdout(sys.stderr):  # stdout stays clean for pipes
+            list_servers(servers)
+        sys.exit(2)
 
     run_server(servers[server_name], tool_name, tool_args, server_name)
 

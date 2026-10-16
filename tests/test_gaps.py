@@ -99,17 +99,24 @@ class GapsTest(unittest.TestCase):
         with open(os.path.join(self.home, ".mcp-cli", "servers.json"), "w") as f:
             json.dump(self.servers, f)
 
-    def run_cli(self, *args, env=None, stdin=None, script=None):
-        """Run mcp-call (or a given script) in a subprocess with an isolated HOME; return (exit code, stdout, stderr)."""
+    def run_cli(self, *args, env=None, stdin=None, cmd=None):
+        """Run mcp-call (or cmd) in a subprocess with an isolated HOME; return (exit code, stdout, stderr)."""
         e = {k: v for k, v in os.environ.items() if not k.startswith("MCP_CALL") and k != "_MCP_CALL_COMPLETE"}
         e.update(HOME=self.home, TMPDIR=self.home, PYTHONPATH=os.path.join(REPO, "src"), NO_COLOR="1",
                  no_proxy="127.0.0.1,localhost", NO_PROXY="127.0.0.1,localhost",
                  SSH_CONNECTION="test 1 test 2")  # belt and braces: --login never opens a browser here
         e.update(env or {})
-        cmd = [sys.executable, script] if script else [sys.executable, "-m", "mcp_cli_skill.cli"]
+        cmd = cmd or [sys.executable, "-m", "mcp_cli_skill.cli"]
         kw = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
         p = subprocess.run([*cmd, *args], env=e, cwd=self.home, capture_output=True, text=True, timeout=30, **kw)
         return p.returncode, p.stdout, p.stderr
+
+    def parse(self, *argv):
+        """parse_args() for argv, in a subprocess with the test HOME: (exit code, result repr or stderr)."""
+        code = ("import sys; from mcp_cli_skill import cli; sys.argv = ['mcp-call', *sys.argv[1:]]; "
+                "print(repr(cli.parse_args(cli.read_config())))")
+        rc, out, err = self.run_cli(*argv, cmd=[sys.executable, "-c", code])
+        return rc, out.strip() if rc == 0 else err
 
     def calls(self):
         if not os.path.exists(self.log):
@@ -168,6 +175,116 @@ class GapsTest(unittest.TestCase):
         code, out, err = self.run_cli("listerr", "echo", "--text=x")
         self.assertEqual((code, json.loads(out)), (0, {"text": "x"}), err)
         self.assertEqual(self.calls(), [{"name": "echo", "arguments": {"text": "x"}}])
+
+
+    # gap 2
+    def test_top_level_list_is_servers(self):
+        for fmt in ((), ("-o", "name"), ("-o", "json")):
+            code, out, err = self.run_cli("--list", *fmt)
+            self.assertEqual((code, out), (0, self.run_cli("--servers", *fmt)[1]), err)
+        self.assertIn("listerr", out)
+
+    def test_top_level_server_flags_need_a_server(self):
+        for argv in (["--tools"], ["--discover"], ["-o", "json"], ["--output=name"], ["--tools", "-o", "json"]):
+            code, out, err = self.run_cli(*argv)
+            self.assertEqual((code, out), (2, ""), argv)
+            self.assertEqual(err, f"Error: {argv[0]} needs a server: mcp-call <server> {' '.join(argv)}"
+                                  " — or search every server: mcp-call --search <words>\n")
+
+    def test_top_level_unknown_option(self):
+        for argv, hint in ((["--serves"], " Did you mean --servers?"), (["-v"], ""), (["--qqqq", "x"], "")):
+            code, out, err = self.run_cli(*argv)
+            self.assertEqual((code, out), (2, ""), argv)
+            self.assertEqual(err, f"Error: unknown option '{argv[0]}'.{hint} See: mcp-call --help\n")
+
+    def test_dash_server_name_still_works(self):
+        self.servers["-odd"] = self.servers["fake"]
+        self.write_servers()
+        code, out, err = self.run_cli("-odd", "--tools", "-o", "name")
+        self.assertEqual((code, out), (0, "-odd echo\n"), err)
+
+    def test_unknown_server_hint_on_stderr(self):
+        code, out, err = self.run_cli("fak", "--tools")
+        self.assertEqual((code, out), (2, ""))  # stdout stays clean for pipes
+        self.assertTrue(err.startswith("Error: 'fak' not found. Did you mean: fake? Available:\n"), err)
+        self.assertIn("listerr", err)  # the server listing moved to stderr
+
+    # gap 3
+    def test_login_no_browser_any_position(self):
+        for argv in (["--login", "html200", "--no-browser"], ["--login", "--no-browser", "html200"],
+                     ["html200", "--login", "--no-browser"], ["html200", "--no-browser", "--login"],
+                     ["--no-browser", "--login", "html200"]):
+            self.assertEqual(self.parse(*argv), (0, "('__login__', 'html200', {'no_browser': True})"), argv)
+        for argv in (["--login", "html200"], ["html200", "--login"]):
+            self.assertEqual(self.parse(*argv), (0, "('__login__', 'html200', {'no_browser': False})"), argv)
+        self.assertEqual(self.parse("--logout", "--no-browser", "html200"), (0, "('__logout__', 'html200', {'no_browser': True})"))
+
+    def test_login_extra_args_exit_2(self):
+        code, err = self.parse("--login", "html200", "--no-brower")
+        self.assertEqual(code, 2)
+        self.assertIn("unexpected argument '--no-brower' for --login. Did you mean --no-browser?", err)
+        for argv in (["--login", "html200", "extra"], ["--login", "--bogus", "html200"], ["html200", "--login", "x"]):
+            self.assertEqual(self.parse(*argv)[0], 2, argv)
+        self.assertEqual(self.parse("--login"), (1, "Usage: mcp-call --login <name>\n"))
+        # end to end: the typo never reaches the login flow (no "Opening the browser", no request)
+        code, out, err = self.run_cli("--login", "html200", "--no-brower")
+        self.assertEqual(code, 2)
+        self.assertNotIn("Opening the browser", err)
+
+    # gap 7
+    def test_bad_user_input_clean_errors(self):
+        cases = [(["fake", "echo", "--input-json", "{bad"], None, "Error: --input-json needs a JSON object: Expecting property name"),
+                 (["fake", "echo", "--input-json=42"], None, "Error: --input-json needs a JSON object:"),
+                 (["fake", "echo"], "not json", "Error: stdin is not valid JSON: Expecting value"),
+                 (["--add-http", "x", "https://e.example", "-H", "NoColon"], None, "Error: header 'NoColon' must look like 'Key: Value'."),
+                 (["--add-http", "x", "https://e.example", "--header=NoColon"], None, "Error: header 'NoColon' must look like 'Key: Value'."),
+                 (["--add", "x", "cmd", "--env", "NOEQ"], None, "Error: --env needs KEY=VALUE, got 'NOEQ'.")]
+        for argv, stdin, msg in cases:
+            code, out, err = self.run_cli(*argv, stdin=stdin)
+            self.assertEqual(code, 2, argv)
+            self.assertNotIn(TB, err, argv)
+            self.assertTrue(err.startswith(msg), (argv, err))
+        with open(os.path.join(self.home, ".mcp-cli", "servers.json")) as f:
+            self.assertNotIn("x", json.load(f))  # nothing saved
+        self.assertEqual(self.calls(), [])
+
+    def test_bad_timeout_env_warns_once_and_uses_default(self):
+        for name, server in (("MCP_CALL_LOGIN_TIMEOUT", "fake"), ("MCP_CALL_HTTP_TIMEOUT", "ssenospace")):
+            code, out, err = self.run_cli(server, "--tools", "-o", "name", env={name: "abc"})
+            self.assertEqual((code, out), (0, f"{server} echo\n"), err)
+            self.assertEqual(err, f"Warning: ignoring {name}='abc' (not an integer); using 300.\n")
+
+    # gap 8
+    def test_leftover_args_exit_2(self):
+        cases = [(["fake", "echo", "--text=x", "--input-json"], "Error: --input-json needs a JSON object: no value given."),
+                 (["fake", "echo", "hello"], "Error: unexpected argument 'hello' for 'fake echo'. Tool params look like"),
+                 (["fake", "echo", "--text=x", "-o", "json"], "Error: unexpected argument '-o' for 'fake echo'."),
+                 (["--servers", "--bogus"], "Error: unexpected argument '--bogus' after --servers."),
+                 (["--servers", "--ouput", "json"], "Error: unexpected argument '--ouput' after --servers. Did you mean --output?"),
+                 (["--search", "echo", "--ouput", "json"], "Error: unexpected argument '--ouput' after --search. Did you mean --output?"),
+                 (["fake", "--tools", "--ouput", "json"], "Error: unexpected argument '--ouput' for 'fake --tools'. Did you mean --output?"),
+                 (["fake", "--tools", "junk"], "Error: unexpected argument 'junk' for 'fake --tools'. For one tool: mcp-call fake junk --help"),
+                 (["--sync", "--bogus"], "Error: unexpected argument '--bogus' after --sync.")]
+        for argv, msg in cases:
+            code, out, err = self.run_cli(*argv)
+            self.assertEqual((code, out), (2, ""), argv)
+            self.assertTrue(err.startswith(msg), (argv, err))
+        self.assertEqual(self.calls(), [])
+
+    def test_normal_tool_args_unchanged(self):
+        code, out, err = self.run_cli("fake", "echo", "--text", "hi", "--count", "3", "--flag", "--mode=b", "--neg", "-5",
+                                      "--", "--help", "--schema=1", "-x", "word")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), {"text": "hi", "count": 3, "flag": True, "mode": "b", "neg": -5, "help": True, "schema": 1})
+        code, out, err = self.run_cli("fake", "echo", "--input-json", '{"text": "ij"}', "--n=1")
+        self.assertEqual(json.loads(out), {"text": "ij", "n": 1}, err)
+        code, out, err = self.run_cli("fake", "echo", stdin='{"text": "in"}')
+        self.assertEqual(json.loads(out), {"text": "in"}, err)
+        code, out, err = self.run_cli("fake", "echo", "hello", "--help")  # a later --help still wins over a stray word
+        self.assertEqual(code, 0, err)
+        self.assertIn("Usage:", out)
+        for argv in (["fake", "-o", "json", "--tools"], ["fake", "--tools", "--help"]):  # listing flags in any order
+            self.assertEqual(self.run_cli(*argv)[0], 0, argv)
 
 
 if __name__ == "__main__":
