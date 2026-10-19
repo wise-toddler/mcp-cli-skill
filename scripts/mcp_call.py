@@ -4,6 +4,7 @@ import base64
 import contextlib
 import difflib
 import hashlib
+import http.client
 import http.server
 import json
 import os
@@ -25,6 +26,21 @@ try:
 except ImportError:  # Windows: the token store runs without a lock
     fcntl = None
 
+_env_warned = set()  # env vars already warned about: one warning per run, not per request
+
+
+def _env_int(name, default):
+    """Integer env var (unset or empty = default); a non-integer warns once on stderr and falls back to default."""
+    raw = os.environ.get(name)
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        if name not in _env_warned:
+            _env_warned.add(name)
+            print(f"Warning: ignoring {name}={raw!r} (not an integer); using {default}.", file=sys.stderr)
+        return default
+
+
 MCP_CALL_TMPDIR = os.path.join(tempfile.gettempdir(), "mcp-call")
 CONFIG_DIR = os.path.expanduser("~/.mcp-cli")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "servers.json")
@@ -32,7 +48,7 @@ CACHE_DIR = os.path.join(CONFIG_DIR, "cache")
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")  # OAuth tokens, mode 0600
-LOGIN_TIMEOUT = int(os.environ.get("MCP_CALL_LOGIN_TIMEOUT") or 300)  # seconds --login waits for the browser
+LOGIN_TIMEOUT = _env_int("MCP_CALL_LOGIN_TIMEOUT", 300)  # seconds --login waits for the browser
 OAUTH_HTTP_TIMEOUT = 30  # every OAuth request gets an explicit timeout
 EXIT_NEEDS_LOGIN = 4  # exit code when the user must run --login
 PROTOCOL_VERSION = "2025-11-25"  # MCP spec version we offer; the server answers with the one it speaks
@@ -47,7 +63,7 @@ META_FLAGS = (
     "--version", "--help",
 )
 # Flags valid after a server name (no tool yet).
-SERVER_FLAGS = ("--tools", "--discover", "--help", "--output")
+SERVER_FLAGS = ("--tools", "--discover", "--help", "--output", "--login", "--logout")
 # Flags valid after a server + tool.
 TOOL_FLAGS = ("--help", "--schema", "--input-json")
 
@@ -203,7 +219,46 @@ def _pop_output(args):
     return fmt, rest
 
 
-def parse_args():
+def _bad_arg(arg, where, flags=(), tail=""):
+    """Exit 2 on an argument that would otherwise be silently dropped or misread; hint the closest flag."""
+    close = difflib.get_close_matches(arg, flags, n=1) if arg.startswith("-") else []
+    hint = f" Did you mean {close[0]}?" if close else ""
+    print(f"Error: unexpected argument '{arg}' {where}.{hint}{tail}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _login_args(flag, rest):
+    """Parse --login/--logout operands: one server name, --no-browser in any position; exit 2 on anything else."""
+    names = [a for a in rest if a != "--no-browser"]
+    if not names:
+        print(f"Usage: mcp-call {flag} <name>", file=sys.stderr)
+        sys.exit(1)
+    extra = [a for a in names if a.startswith("-")] + names[1:]
+    if extra:  # e.g. a --no-brower typo must never fall through to opening the browser
+        usage = f" Usage: mcp-call {flag} <name>" + (" [--no-browser]" if flag == "--login" else "")
+        _bad_arg(extra[0], f"for {flag}", ("--no-browser",), usage)
+    return f"__{flag[2:]}__", names[0], {"no_browser": "--no-browser" in rest}
+
+
+def _put_header(headers, text):
+    """Add a 'Key: Value' header to headers; exit 2 if it has no colon."""
+    if ":" not in text:
+        print(f"Error: header '{text}' must look like 'Key: Value'.", file=sys.stderr)
+        sys.exit(2)
+    k, v = text.split(":", 1)
+    headers[k.strip()] = v.strip()
+
+
+def _input_json(tool_args, text):
+    """Merge --input-json's JSON object into tool_args; exit 2 with a clean error if it isn't one."""
+    try:
+        tool_args.update(json.loads(text))
+    except (ValueError, TypeError) as e:
+        print(f"Error: --input-json needs a JSON object: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def parse_args(servers=()):
     """Parse CLI arguments into server, tool, and args dict."""
     args = sys.argv[1:]
     if args and args[0] == "--version":
@@ -219,26 +274,30 @@ def parse_args():
             print("unknown")
         sys.exit(0)
     if not args or args[0] in ("-h", "--help"):
-        print("Usage: mcp-call <server> <tool> [--key=value ...] [--input-json '{...}'] [-- <tool params verbatim>]", file=sys.stderr)
-        print("       mcp-call --servers [-o table|json|name]", file=sys.stderr)
-        print("       mcp-call <server> --tools [-o table|json|name]", file=sys.stderr)
-        print("       mcp-call <server> --discover", file=sys.stderr)
-        print("       mcp-call <server> <tool> --help     (formatted help)", file=sys.stderr)
-        print("       mcp-call <server> <tool> --schema   (raw JSON schema)", file=sys.stderr)
-        print("       mcp-call --add <name> <command> [args...] [--env KEY=VAL ...]", file=sys.stderr)
-        print("       mcp-call --add-http <name> <url>", file=sys.stderr)
-        print("       mcp-call --remove <name>", file=sys.stderr)
-        print("       mcp-call --login <name> [--no-browser]  (OAuth browser login; --no-browser only prints the URL)", file=sys.stderr)
-        print("       mcp-call --logout <name>            (forget stored OAuth tokens)", file=sys.stderr)
-        print("       mcp-call --sync", file=sys.stderr)
-        print("       mcp-call --completion <bash|zsh|fish>", file=sys.stderr)
-        print("       mcp-call --refresh-completions      (cache tool lists for tab completion)", file=sys.stderr)
-        print("       mcp-call --clear-cache [server]", file=sys.stderr)
-        print("       mcp-call --search <word> [word ...] [-o table|json|name]  (find tools across all servers, local cache)", file=sys.stderr)
+        out = sys.stdout if args else sys.stderr  # asked-for help is pipeable; a bare call is an error
+        print("Usage: mcp-call <server> <tool> [--key=value ...] [--input-json '{...}'] [-- <tool params verbatim>]", file=out)
+        print("       mcp-call --servers [-o table|json|name]", file=out)
+        print("       mcp-call <server> --tools [-o table|json|name]", file=out)
+        print("       mcp-call <server> --discover", file=out)
+        print("       mcp-call <server> <tool> --help     (formatted help)", file=out)
+        print("       mcp-call <server> <tool> --schema   (raw JSON schema)", file=out)
+        print("       mcp-call --add <name> <command> [args...] [--env KEY=VAL ...]", file=out)
+        print("       mcp-call --add-http <name> <url> [-H|--header 'Key: Value' ...]", file=out)
+        print("       mcp-call --remove <name>", file=out)
+        print("       mcp-call --login <name> [--no-browser]  (OAuth browser login; --no-browser only prints the URL)", file=out)
+        print("       mcp-call --logout <name>            (forget stored OAuth tokens)", file=out)
+        print("       mcp-call --sync", file=out)
+        print("       mcp-call --completion <bash|zsh|fish>", file=out)
+        print("       mcp-call --refresh-completions      (cache tool lists for tab completion)", file=out)
+        print("       mcp-call --clear-cache [server]", file=out)
+        print("       mcp-call --search <word> [word ...] [-o table|json|name]  (find tools across all servers, local cache)", file=out)
         sys.exit(0 if args else 1)
 
-    if args[0] == "--servers":
-        return "__servers__", None, {"output": _pop_output(args[1:])[0]}
+    if args[0] in ("--servers", "--list"):  # --list: what people guess for "list servers"
+        fmt, extra = _pop_output(args[1:])
+        if extra:
+            _bad_arg(extra[0], f"after {args[0]}", ("-o", "--output"))
+        return "__servers__", None, {"output": fmt}
     if args[0] == "--add":
         return "__add__", None, {"_raw": args[1:]}
     if args[0] == "--add-http":
@@ -250,13 +309,10 @@ def parse_args():
         while i < len(args):
             a = args[i]
             if a in ("-H", "--header") and i + 1 < len(args):
-                k, v = args[i + 1].split(":", 1)
-                add_args["headers"][k.strip()] = v.strip()
+                _put_header(add_args["headers"], args[i + 1])
                 i += 2
             elif a.startswith("--header=") or a.startswith("-H="):
-                _, v = a.split("=", 1)
-                k, v = v.split(":", 1)
-                add_args["headers"][k.strip()] = v.strip()
+                _put_header(add_args["headers"], a.split("=", 1)[1])
                 i += 1
             else:
                 print(f"Error: unknown flag {a!r} for --add-http. Use -H or --header 'Key: Value'.", file=sys.stderr)
@@ -267,12 +323,17 @@ def parse_args():
             print("Usage: mcp-call --remove <name>", file=sys.stderr)
             sys.exit(1)
         return "__remove__", args[1], {}
-    if args[0] in ("--login", "--logout"):
-        if len(args) < 2:
-            print(f"Usage: mcp-call {args[0]} <name>", file=sys.stderr)
-            sys.exit(1)
-        return f"__{args[0][2:]}__", args[1], {"no_browser": "--no-browser" in args[2:]}
+    # --login|--logout <name>, or the `<name> --login|--logout` alias; --no-browser may sit anywhere
+    pos = [a for a in args if a != "--no-browser"]
+    login = ("--login", "--logout")
+    if pos and pos[0] in login or len(pos) > 1 and pos[1] in login and not pos[0].startswith("-"):
+        flag = pos[0] if pos[0] in login else pos[1]
+        rest = list(args)
+        rest.remove(flag)
+        return _login_args(flag, rest)
     if args[0] == "--sync":
+        if len(args) > 1:
+            _bad_arg(args[1], "after --sync")
         return "__sync__", None, {}
     if args[0] == "--completion":
         shell = args[1] if len(args) > 1 else "bash"
@@ -283,19 +344,35 @@ def parse_args():
         return "__clear_cache__", args[1] if len(args) > 1 else None, {}
     if args[0] == "--search":
         fmt, terms = _pop_output(args[1:])
+        flags = [t for t in terms if t.startswith("-")]
+        if flags:
+            _bad_arg(flags[0], "after --search", ("-o", "--output"))
         if not terms:
             print("Usage: mcp-call --search <word> [word ...] [-o table|json|name]", file=sys.stderr)
             sys.exit(1)
         return "__search__", None, {"terms": terms, "output": fmt}
 
+    if args[0].startswith("-") and args[0] not in servers:
+        # never treat an option as a server name
+        flag = args[0]
+        if flag in ("--tools", "--discover", "-o", "--output") or flag.startswith(("-o=", "--output=")):
+            print(f"Error: {flag} needs a server: mcp-call <server> {' '.join(args)} — or search every server: mcp-call --search <words>", file=sys.stderr)
+            sys.exit(2)
+        close = difflib.get_close_matches(flag, META_FLAGS, n=1)
+        hint = f" Did you mean {close[0]}?" if close else ""
+        print(f"Error: unknown option '{flag}'.{hint} See: mcp-call --help", file=sys.stderr)
+        sys.exit(2)
+
     server = args[0]
-    # `mcp-call <server> --login|--logout` alias the top-level flags
-    if len(args) > 1 and args[1] in ("--login", "--logout"):
-        return f"__{args[1][2:]}__", server, {"no_browser": "--no-browser" in args[2:]}
     # --list / --help / -h are what people (and agents) guess for "list tools"; `<server> -o json` lists too
     if len(args) < 2 or args[1] in ("--tools", "--list", "--help", "-h", "-o", "--output") \
             or args[1].startswith(("-o=", "--output=")):
-        return server, "__tools__", {"output": _pop_output(args[1:])[0]}
+        fmt, extra = _pop_output(args[1:])
+        extra = [a for a in extra if a not in ("--tools", "--list", "--help", "-h")]
+        if extra:
+            tail = "" if extra[0].startswith("-") else f" For one tool: mcp-call {server} {extra[0]} --help"
+            _bad_arg(extra[0], f"for '{server} {args[1]}'", ("-o", "--output", "--tools"), tail)
+        return server, "__tools__", {"output": fmt}
     if args[1] == "--discover":
         return server, "__discover__", {}
     if args[1].startswith("-"):
@@ -307,6 +384,7 @@ def parse_args():
 
     tool = args[1]
     tool_args = {}
+    stray = []  # bare words / single-dash tokens: rejected after the loop, so a later --help/--schema still wins
     i = 2
     verbatim = False  # after a bare `--`, everything is tool params, never meta-flags
     while i < len(args):
@@ -317,12 +395,15 @@ def parse_args():
             return server, "__schema__", {"_tool": tool}
         elif not verbatim and arg in ("--help", "-h"):
             return server, "__help__", {"_tool": tool}
-        elif not verbatim and arg == "--input-json" and i + 1 < len(args):
-            tool_args.update(json.loads(args[i + 1]))
+        elif not verbatim and arg == "--input-json":
+            if i + 1 >= len(args):
+                print("Error: --input-json needs a JSON object: no value given.", file=sys.stderr)
+                sys.exit(2)
+            _input_json(tool_args, args[i + 1])
             i += 2
             continue
         elif not verbatim and arg.startswith("--input-json="):
-            tool_args.update(json.loads(arg[13:]))
+            _input_json(tool_args, arg[13:])
         elif arg.startswith("--") and "=" in arg:
             key, val = arg[2:].split("=", 1)
             tool_args[key] = parse_value(val)
@@ -333,12 +414,20 @@ def parse_args():
                 i += 2
                 continue
             tool_args[arg[2:]] = True
+        elif not verbatim:
+            stray.append(arg)
         i += 1
+    if stray:
+        _bad_arg(stray[0], f"for '{server} {tool}'", tail=" Tool params look like --key=value or --key value.")
     # read JSON from stdin if no args provided and stdin is piped
     if not tool_args and not sys.stdin.isatty():
         stdin_data = sys.stdin.read().strip()
         if stdin_data:
-            tool_args = json.loads(stdin_data)
+            try:
+                tool_args = json.loads(stdin_data)
+            except ValueError as e:
+                print(f"Error: stdin is not valid JSON: {e}", file=sys.stderr)
+                sys.exit(2)
     return server, tool, tool_args
 
 
@@ -438,7 +527,7 @@ class HttpSession:
         """
         # Long-running tool calls (bash, LLM, etc) can exceed 30s; make it tunable.
         if timeout is None:
-            timeout = int(os.environ.get("MCP_CALL_HTTP_TIMEOUT", "300"))
+            timeout = _env_int("MCP_CALL_HTTP_TIMEOUT", 300)
         url = self.url
         for _ in range(max_redirects + 1):
             if _origin(url) != _origin(self.config_url):
@@ -488,7 +577,12 @@ class HttpSession:
                 content_type = resp.headers.get("Content-Type", "")
                 if "text/event-stream" in content_type:
                     return _parse_sse(body, msg_id)
-                return json.loads(body)
+                try:
+                    return json.loads(body)
+                except ValueError:
+                    # like a stdio server's non-JSON output (v0.4.1): say what came back, no traceback
+                    snippet = _clean(" ".join(body.split())[:200]) or "empty body"
+                    raise McpError(f"Error: non-JSON response from {self.url} (HTTP {resp.status}): {snippet}")
         except urllib.error.HTTPError as e:
             body = e.read().decode() if e.fp else ""
             # OAuth 401: refresh + retry once; decide on "did we send a token", not the 401's error code
@@ -518,6 +612,9 @@ class HttpSession:
         except TimeoutError:
             # urlopen raises bare TimeoutError in Python 3.10+, not URLError.
             raise McpError(f"Error: request to {self.url} timed out. Set MCP_CALL_HTTP_TIMEOUT=<sec> for longer.")
+        except (ValueError, http.client.HTTPException, ConnectionError) as e:
+            # undecodable body, or the connection dropped mid-response
+            raise McpError(f"Error: bad response from {self.url}: {_clean(e) or type(e).__name__}")
 
     def notify(self, method, params=None):
         """Send JSON-RPC notification (no id, ignore response)."""
@@ -549,10 +646,10 @@ class HttpSession:
 def _parse_sse(body, expected_id):
     """Parse SSE response and extract JSON-RPC message matching expected_id."""
     for line in body.splitlines():
-        if line.startswith("data: "):
+        if line.startswith("data:"):  # the space after "data:" is optional
             try:
-                msg = json.loads(line[6:])
-                if msg.get("id") == expected_id:
+                msg = json.loads(line[5:])
+                if isinstance(msg, dict) and msg.get("id") == expected_id:
                     return msg
             except json.JSONDecodeError:
                 continue
@@ -894,6 +991,8 @@ def recv(proc, expected_id=None):
         try:
             resp = json.loads(line)
         except json.JSONDecodeError:
+            resp = None
+        if not isinstance(resp, dict):  # not JSON, or JSON that isn't an object (42, null, [])
             non_json.append(line.rstrip())
             continue
         if expected_id is None or resp.get("id") == expected_id:
@@ -927,8 +1026,11 @@ def check_alive(proc):
 class StdioSession:
     """Stdio MCP server process behind the same rpc/notify interface as HttpSession."""
 
-    def __init__(self, config):
-        self.proc = spawn_server(config)
+    def __init__(self, config, server_name=""):
+        try:
+            self.proc = spawn_server(config)
+        except OSError as e:  # command missing or not executable
+            raise McpError(f"Error: cannot start server '{server_name}': {_expand_env(config['command'])}: {e.strerror or e}")
 
     def rpc(self, method, params=None, msg_id=1):
         """Send JSON-RPC request via stdio and return the matching response (None if none)."""
@@ -958,7 +1060,7 @@ class StdioSession:
 def _open_session(config, server_name=""):
     """Yield an HTTP or stdio session after the initialize handshake; closes it on exit."""
     stdio = not is_http(config)
-    session = StdioSession(config) if stdio else HttpSession(config["url"], config.get("headers"), server_name)
+    session = StdioSession(config, server_name) if stdio else HttpSession(config["url"], config.get("headers"), server_name)
     with session:
         if stdio:
             check_alive(session.proc)
@@ -996,14 +1098,16 @@ def call_tool(config, tool_name, tool_args, server_name=""):
 
 # --- Tool discovery ---
 
-def fetch_tools(config, server_name=""):
-    """Fetch tools list from server (HTTP or stdio), caching for completion."""
+def fetch_tools(config, server_name="", strict=True):
+    """Fetch tools list from server (HTTP or stdio), caching for completion; strict raises on a JSON-RPC error."""
     tools = []
     with _open_session(config, server_name) as session:
         cursor, msg_id = None, 2
         while True:
             params = {"cursor": cursor} if cursor else {}
             resp = session.rpc("tools/list", params, msg_id=msg_id)
+            if strict and resp and "error" in resp:
+                raise McpError(f"Error: tools/list failed: {json.dumps(resp['error'])}")
             if not resp or "result" not in resp:
                 break
             tools += resp["result"].get("tools", [])
@@ -1170,7 +1274,8 @@ def _config_key(name, cfg):
     if is_http(cfg):
         # same URL under another name is a different account or key, never an alias
         return ("http", cfg["url"], name)
-    return ("stdio", cfg.get("command", "?"), tuple(cfg.get("args", [])))
+    # same command with another env (token, account) is another server too; env is never printed
+    return ("stdio", cfg.get("command", "?"), tuple(cfg.get("args", [])), json.dumps(cfg.get("env") or {}, sort_keys=True))
 
 
 def _truncate(text, width):
@@ -1243,8 +1348,9 @@ def list_servers(servers, fmt="table"):
             print(line)
             # show extra aliases under primary, indented
             if len(names_sorted) > 1:
-                aliases = ", ".join(names_sorted[1:6])
-                more = f" +{len(names_sorted) - 6} more" if len(names_sorted) > 6 else ""
+                cut = 6 if sys.stdout.isatty() else len(names_sorted)  # shorten only for humans; pipes get every alias
+                aliases = ", ".join(names_sorted[1:cut])
+                more = f" +{len(names_sorted) - cut} more" if len(names_sorted) > cut else ""
                 print(f"    {c['dim']}aliases: {aliases}{more}{c['reset']}")
 
     if http_groups:
@@ -1267,6 +1373,9 @@ def add_server(raw_args):
     i = 2
     while i < len(raw_args):
         if raw_args[i] == "--env" and i + 1 < len(raw_args):
+            if "=" not in raw_args[i + 1]:
+                print(f"Error: --env needs KEY=VALUE, got '{raw_args[i + 1]}'.", file=sys.stderr)
+                sys.exit(2)
             k, v = raw_args[i + 1].split("=", 1)
             env[k] = v
             i += 2
@@ -1410,10 +1519,18 @@ def _completion_candidates(prior, partial):
     # only those, not random server/tool names.
     if prior == ["--remove"] or prior == ["--clear-cache"]:
         return list(_load_json(CONFIG_PATH).keys())
-    if prior in (["--login"], ["--logout"]):
+    login = [a for a in prior if a != "--no-browser"]
+    if login in (["--login"], ["--logout"]):
         return [n for n, cfg in _load_json(CONFIG_PATH).items() if is_http(cfg)]
+    # after `--login <name>` (or `<name> --login`) only --no-browser is left to type
+    if len(login) == 2 and ("--login" in login or "--logout" in login):
+        return ["--no-browser"] if "--login" in login and "--no-browser" not in prior else []
     if prior and prior[-1] in ("-o", "--output"):
         return list(OUTPUT_FORMATS)
+    # --servers and <server> --tools take only -o/--output
+    if prior and prior[0] in ("--servers", "--list") or \
+            len(prior) > 1 and prior[1] in ("--tools", "--list") and not prior[0].startswith("-"):
+        return ["-o", "--output"]
     if prior == ["--completion"]:
         return ["bash", "zsh", "fish"]
     # --add / --add-http take free-form command/URL/headers — nothing useful to suggest.
@@ -1493,8 +1610,8 @@ def run_server(config, tool_name, tool_args, server_name=""):
     # tool calls: a name missing from the cached list is a typo or a newly added tool,
     # so re-fetch once (refreshes the cache) and only refuse if the server lacks it too
     if server_name and tool_name not in [t.get("name") for t in _cache_read(server_name)]:
-        names = [t.get("name") for t in fetch_tools(config, server_name)]
-        if names and tool_name not in names:  # empty list = server can't list tools; let the call decide
+        names = [t.get("name") for t in fetch_tools(config, server_name, strict=False)]
+        if names and tool_name not in names:  # empty list = server can't (or won't) list tools; let the call decide
             _unknown_tool(server_name, tool_name, names)
     call_tool(config, tool_name, tool_args, server_name)
 
@@ -1507,7 +1624,7 @@ def _main():
         return
 
     servers = read_config()
-    server_name, tool_name, tool_args = parse_args()
+    server_name, tool_name, tool_args = parse_args(servers)
 
     if server_name == "__servers__":
         list_servers(servers, tool_args["output"])
@@ -1552,6 +1669,9 @@ def _main():
         refresh_completions()
         return
     if server_name == "__clear_cache__":
+        if tool_name and tool_name not in servers and not os.path.exists(_cache_path(tool_name)):
+            print(f"No cache for '{tool_name}'.", file=sys.stderr)
+            sys.exit(1)
         _cache_clear(tool_name)
         print(f"Cleared cache{' for ' + tool_name if tool_name else ''}.")
         return
@@ -1560,9 +1680,12 @@ def _main():
         return
 
     if server_name not in servers:
-        print(f"Error: '{server_name}' not found. Available:", file=sys.stderr)
-        list_servers(servers)
-        sys.exit(1)
+        close = difflib.get_close_matches(server_name, list(servers), n=3)
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        print(f"Error: '{server_name}' not found.{hint} Available:", file=sys.stderr)
+        with contextlib.redirect_stdout(sys.stderr):  # stdout stays clean for pipes
+            list_servers(servers)
+        sys.exit(2)
 
     run_server(servers[server_name], tool_name, tool_args, server_name)
 
