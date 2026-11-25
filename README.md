@@ -15,6 +15,13 @@ uvx mcp-cli-skill --servers
 npx skills add wise-toddler/mcp-cli-skill -g
 ```
 
+Or as a Claude Code plugin (the skill only; the CLI still comes from pipx):
+
+```
+/plugin marketplace add wise-toddler/shivansh-mods
+/plugin install mcp-cli@shivansh-mods
+```
+
 ## Usage
 
 ```bash

@@ -1,0 +1,8 @@
+{
+  "name": "mcp-cli",
+  "description": "Skill that teaches Claude to call any MCP server's tools from the shell with mcp-call (install the CLI with pipx install mcp-cli-skill)",
+  "author": {
+    "name": "wise-toddler"
+  },
+  "skills": ["./"]
+}
